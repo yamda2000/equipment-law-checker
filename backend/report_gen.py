@@ -3,12 +3,14 @@
 from datetime import datetime
 import json
 import uuid
+import urllib.parse
+
+from backend.tools.egov import fetch_article_text
 
 
 PRIORITY_CONFIG = {
     "required": {"label": "🔴 必須対応", "color": "#FFEBEE", "border": "#C62828"},
     "check":    {"label": "🟡 要確認",   "color": "#FFFDE7", "border": "#F57F17"},
-    "pending":  {"label": "🔵 確認中",   "color": "#E3F2FD", "border": "#1565C0"},
 }
 
 
@@ -34,7 +36,7 @@ def generate_html_report(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>法令・届出確認レポート {case_id}</title>
+<title>法令・届出施設確認レポート {case_id}</title>
 <style>
   body {{ font-family: 'Noto Sans JP', 'メイリオ', sans-serif; font-size: 14px;
           color: #212121; background: #fafafa; margin: 0; padding: 24px; }}
@@ -81,7 +83,7 @@ def generate_html_report(
 <body>
 <div class="container">
 
-<h1>⚖️ 設備導入時 法令・届出確認レポート</h1>
+<h1>⚖️ 設備導入時 法令・届出施設確認レポート</h1>
 
 <table class="meta-table">
   <tr><td>案件ID</td><td>{case_id}</td></tr>
@@ -142,7 +144,7 @@ def _build_info_rows(info: dict) -> str:
 
 
 def _build_summary(law_items: list) -> str:
-    cnt = {"required": 0, "check": 0, "pending": 0}
+    cnt = {"required": 0, "check": 0}
     for law in law_items:
         p = law.get("priority", "check")
         if p in cnt:
@@ -154,11 +156,84 @@ def _build_summary(law_items: list) -> str:
                 f'<div class="num" style="color:{text_color}">{n}</div>'
                 f'<div style="font-size:13px;color:{text_color}">{label}</div></div>')
 
-    return (f'<div class="summary-grid">'
+    return (f'<div class="summary-grid" style="grid-template-columns:repeat(2,1fr);">'
             f'{box("required", "🔴 必須対応", "#FFEBEE", "#C62828")}'
             f'{box("check",    "🟡 要確認",   "#FFFDE7", "#F57F17")}'
-            f'{box("pending",  "🔵 確認中",   "#E3F2FD", "#1565C0")}'
             f'</div>')
+
+
+def _build_article_block(law: dict) -> str:
+    """条番号＋届出施設のサマリーカードと条文インライン表示を生成する。
+    （ステップ5「結果確認」の表示とフォーマットを統一）"""
+    law_name = law.get("law_name", "")
+    law_id = law.get("law_id", "")
+    law_revision_id = law.get("law_revision_id", "")
+    relevant_articles = [a for a in law.get("relevant_articles", []) if a and a.strip()]
+
+    # 届出施設を重複なしで収集
+    authorities = list(dict.fromkeys(
+        d.get("authority", "") for d in law.get("deliveries", []) if d.get("authority", "")
+    ))
+
+    # 条文テキストを取得（e-Gov）。XMLは結果確認時にキャッシュ済みのため通常は即時。
+    article_texts: dict = {}
+    if law_id and relevant_articles:
+        try:
+            article_texts = fetch_article_text(law_id, relevant_articles, law_revision_id)
+        except Exception:
+            article_texts = {}
+    # error キーは表示対象外
+    article_texts = {k: v for k, v in (article_texts or {}).items() if k != "error"}
+
+    def _art_link(a: str) -> str:
+        if law_id:
+            return (f'<a href="https://laws.e-gov.go.jp/law/{law_id}" target="_blank" '
+                    f'style="color:#1565C0;text-decoration:underline;">{a}</a>')
+        return f'<span style="color:#1565C0;">{a}</span>'
+
+    art_str = "　".join(_art_link(a) for a in relevant_articles) \
+        if relevant_articles else '<span style="color:#888;">条番号確認中</span>'
+    auth_str = "　/　".join(authorities) if authorities else '<span style="color:#888;">―</span>'
+
+    summary_card = (
+        f'<div style="border:1px solid #E0E0E0;border-radius:6px;overflow:hidden;margin:10px 0;">'
+        f'<div style="display:flex;align-items:flex-start;background:#EFF3FF;border-bottom:1px solid #E0E0E0;">'
+        f'<div style="padding:7px 12px;color:#1565C0;font-weight:700;font-size:13px;min-width:90px;white-space:nowrap;">📖 条番号</div>'
+        f'<div style="padding:7px 12px;font-size:13px;">{art_str}</div>'
+        f'</div>'
+        f'<div style="display:flex;align-items:center;background:#F3FBF0;">'
+        f'<div style="padding:7px 12px;color:#2E7D32;font-weight:700;font-size:13px;min-width:90px;white-space:nowrap;">🏛️ 届出施設</div>'
+        f'<div style="padding:7px 12px;font-size:13px;color:#1B5E20;font-weight:600;">{auth_str}</div>'
+        f'</div>'
+        f'</div>'
+    )
+
+    if article_texts:
+        art_rows = "".join(
+            f'<div style="margin-bottom:10px;">'
+            f'<div style="font-size:12px;font-weight:700;color:#1565C0;margin-bottom:3px;">{ref}</div>'
+            f'<div style="font-size:12px;color:#333;line-height:1.75;white-space:pre-wrap;">{text}</div>'
+            f'</div>'
+            for ref, text in article_texts.items()
+        )
+        article_box = (
+            f'<div style="background:#F8F9FA;border-left:3px solid #1565C0;'
+            f'border-radius:0 4px 4px 0;padding:10px 14px;margin:10px 0;">'
+            f'<div style="font-size:11px;color:#888;margin-bottom:6px;">📜 条文（e-Gov）</div>'
+            f'{art_rows}'
+            f'</div>'
+        )
+    else:
+        egov_url = (
+            f"https://laws.e-gov.go.jp/law/{law_id}" if law_id
+            else f"https://laws.e-gov.go.jp/search?lawname={urllib.parse.quote(law_name)}"
+        )
+        article_box = (
+            f'<div style="margin:8px 0;"><a href="{egov_url}" target="_blank" '
+            f'style="font-size:12px;color:#1565C0;">🔗 e-Gov で条文を確認</a></div>'
+        )
+
+    return summary_card + article_box
 
 
 def _build_law_items(law_items: list) -> str:
@@ -172,6 +247,8 @@ def _build_law_items(law_items: list) -> str:
         badge_class = f"badge-{p}"
         review = law.get("review_decision", "")
         review_html = f'<span class="review-badge">✅ {review}</span>' if review else ""
+
+        article_block = _build_article_block(law)
 
         relevant_articles = law.get("relevant_articles", [])
         deliveries_html = ""
@@ -209,6 +286,7 @@ def _build_law_items(law_items: list) -> str:
     {review_html}
   </div>
   <div class="law-applicability">📌 {law.get('applicability', '')}</div>
+  {article_block}
   {'<div class="section-label">📋 届出・申請事項</div>' + deliveries_html if deliveries_html else '<div class="section-label" style="color:#888">📋 届出・申請事項なし（要確認）</div>'}
   {'<div class="section-label">🏢 社内対応事項</div>' + internal_html if internal_html else ''}
 </div>"""

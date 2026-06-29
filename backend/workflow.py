@@ -17,6 +17,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+try:
+    from langgraph.config import get_stream_writer
+except Exception:  # 古いバージョン互換
+    get_stream_writer = None
+
 from backend.state import AppState
 from backend.prompts import HEARING_SYSTEM, ANALYSIS_SYSTEM, SYNTHESIS_SYSTEM, SEARCH_AGENT_SYSTEM
 from backend.tools.egov import search_laws_by_keyword
@@ -58,7 +63,7 @@ class AnalysisResult(BaseModel):
     analysis_summary: str = Field(description="設備情報の分析サマリー")
 
 
-MAX_SEARCH_ITERATIONS = 10
+MAX_SEARCH_ITERATIONS = 20
 
 
 class SearchAction(BaseModel):
@@ -242,8 +247,27 @@ def search_node(state: AppState) -> dict:
     seen_titles: set[str] = set()
     search_log: list[str] = []
     progress_messages: list = []
+    failed_queries: set[str] = set()  # 0件だったクエリを記録
+
+    # 進捗のライブ送信（stream_mode="custom"）。invoke 実行時は no-op。
+    _writer = None
+    if get_stream_writer is not None:
+        try:
+            _writer = get_stream_writer()
+        except Exception:
+            _writer = None
+
+    def emit(entry: str) -> None:
+        if _writer is not None:
+            try:
+                _writer({"progress": entry})
+            except Exception:
+                pass
+
+    emit("🔎 法令調査を開始します（e-Gov 法令API ＋ Web検索）...")
 
     # シード: 最初の3キーワードで初期データを収集してからLLMに判断させる
+    emit("📚 e-Gov 法令API でキーワード検索中...")
     for kw in initial_keywords[:3]:
         laws = search_laws_by_keyword(kw, max_results=4)
         added = 0
@@ -256,10 +280,13 @@ def search_node(state: AppState) -> dict:
         entry = f"🔍 [e-Gov] 「{kw}」→ {added}件取得"
         search_log.append(entry)
         progress_messages.append(AIMessage(content=entry, name="search_progress"))
+        emit(entry)
 
-    # 必須Web検索①: 横浜市・神奈川県の条例
+    # 必須Web検索①: 横浜市・神奈川県の条例・届出施設
+    emit("🌐 横浜市・神奈川県の条例・届出施設をWeb検索中...")
     equipment_type_str = equipment_info.get("equipment_type", "設備")
     for local_query in [
+        f"横浜市 {equipment_type_str} 届出施設 手続き 規制",
         f"横浜市 {equipment_type_str} 届出 条例 規制",
         f"神奈川県 {equipment_type_str} 届出 条例 規制",
     ]:
@@ -267,16 +294,24 @@ def search_node(state: AppState) -> dict:
         entry, added = _process_web_results(web_results, local_query, seen_titles, results, "条例Web")
         search_log.append(entry)
         progress_messages.append(AIMessage(content=entry, name="search_progress"))
+        emit(entry)
 
     # 必須Web検索②: 省庁ガイドライン・FAQ
+    emit("🌐 省庁ガイドライン・FAQ をWeb検索中...")
     guideline_query = f"{equipment_type_str} 設置 届出 省庁 ガイドライン FAQ"
     web_results = search_web(guideline_query)
     entry, added = _process_web_results(web_results, guideline_query, seen_titles, results, "ガイドラインWeb")
     search_log.append(entry)
     progress_messages.append(AIMessage(content=entry, name="search_progress"))
+    emit(entry)
 
     # Agenticループ
     for iteration in range(MAX_SEARCH_ITERATIONS):
+        # 進捗表示：何回目の判断か
+        progress_msg = f"🔄 AIが追加調査の要否を判断中（{iteration + 1}回目／最大{MAX_SEARCH_ITERATIONS}回）"
+        progress_messages.append(AIMessage(content=progress_msg, name="search_progress"))
+        emit(progress_msg)
+
         issues_str   = "\n".join(f"- {i}" for i in issues)
         keywords_str = "\n".join(f"- {k}" for k in initial_keywords)
         history_str  = "\n".join(search_log) if search_log else "（なし）"
@@ -285,11 +320,13 @@ def search_node(state: AppState) -> dict:
             for r in results[:25]
         ) if results else "（なし）"
 
+        failed_str = "\n".join(f"- {q}" for q in failed_queries) if failed_queries else "なし"
         context = (
             f"## 設備情報\n{json.dumps(equipment_info, ensure_ascii=False, indent=2)}\n\n"
             f"## 調査が必要な項目\n{issues_str}\n\n"
             f"## 推奨検索キーワード（参考）\n{keywords_str}\n\n"
             f"## 検索履歴（{iteration + 1}回目判断）\n{history_str}\n\n"
+            f"## ⚠️ 0件だったクエリ（再検索禁止）\n{failed_str}\n\n"
             f"## 取得済み法令・情報（{len(results)}件）\n{results_str}"
         )
 
@@ -299,9 +336,19 @@ def search_node(state: AppState) -> dict:
         ])
 
         if action.done or not action.query:
+            done_entry = f"✅ 調査完了（{iteration + 1}回の判断で収集十分と判断しました）"
+            progress_messages.append(AIMessage(content=done_entry, name="search_progress"))
+            emit(done_entry)
             break
 
-        if action.search_type == "egov":
+        # 0件クエリの再検索をスキップ
+        if action.query in failed_queries:
+            skip_entry = f"⏭️ スキップ（0件クエリ再試行）:「{action.query}」"
+            search_log.append(skip_entry)
+            progress_messages.append(AIMessage(content=skip_entry, name="search_progress"))
+            emit(skip_entry)
+        elif action.search_type == "egov":
+            emit(f"📚 e-Gov 法令API で追加検索中:「{action.query}」")
             laws = search_laws_by_keyword(action.query, max_results=5)
             added = 0
             for law in laws:
@@ -310,15 +357,22 @@ def search_node(state: AppState) -> dict:
                     seen_titles.add(title)
                     results.append(law)
                     added += 1
-            entry = f"🔍 [e-Gov] 「{action.query}」→ {added}件新規取得"
+            if added == 0:
+                failed_queries.add(action.query)
+            entry = f"🔍 [e-Gov API] 「{action.query}」→ {added}件新規取得"
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
+            emit(entry)
         else:
+            emit(f"🌐 Web検索中:「{action.query}」")
             web_results = search_web(action.query)
-            entry, added = _process_web_results(web_results, action.query, seen_titles, results, "Web")
+            entry, added = _process_web_results(web_results, action.query, seen_titles, results, "AIWeb検索")
             entry = entry.replace("取得", "新規取得")
+            if added == 0:
+                failed_queries.add(action.query)
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
+            emit(entry)
 
     egov_count = len([r for r in results if "e-Gov" in r.get("source", "")])
     web_count  = len([r for r in results if "e-Gov" not in r.get("source", "")])
@@ -327,6 +381,8 @@ def search_node(state: AppState) -> dict:
         f"e-Gov {egov_count}件、Web {web_count}件、計{len(results)}件を収集しました。"
     )
     progress_messages.append(AIMessage(content=summary_msg))
+    emit(summary_msg)
+    emit("🧩 調査結果を統合し、法令別の対応事項を整理中...")
 
     return {
         "search_results": results[:30],
@@ -361,21 +417,46 @@ def synthesis_node(state: AppState) -> dict:
 
     law_items = [item.model_dump() for item in result.law_items]
 
-    # e-Gov の law_id を法令名で逆引きして付与
+    # e-Gov の law_id / law_revision_id を法令名で逆引きして付与
     search_results = state.get("search_results", [])
-    title_to_id = {
-        r["title"]: r["law_id"]
-        for r in search_results
-        if r.get("law_id") and r.get("title") and r.get("source", "").startswith("e-Gov")
-    }
+    title_to_ids: dict[str, dict] = {}
+    for r in search_results:
+        t = r.get("title", "")
+        if t and r.get("source", "").startswith("e-Gov"):
+            title_to_ids[t] = {
+                "law_id":          r.get("law_id", ""),
+                "law_revision_id": r.get("law_revision_id", ""),
+            }
     for law in law_items:
         law_name = law.get("law_name", "")
-        for title, lid in title_to_id.items():
+        for title, ids in title_to_ids.items():
             if law_name in title or title in law_name:
-                law["law_id"] = lid
+                law["law_id"]          = ids["law_id"]
+                law["law_revision_id"] = ids["law_revision_id"]
                 break
         else:
             law.setdefault("law_id", "")
+            law.setdefault("law_revision_id", "")
+
+    # law_id が未解決の法令だけ e-Gov API で補完検索
+    for law in law_items:
+        if not law.get("law_id"):
+            law_name = law.get("law_name", "")
+            if law_name:
+                hits = search_laws_by_keyword(law_name, max_results=1)
+                if hits:
+                    law["law_id"] = hits[0].get("law_id", "")
+
+    # relevant_articles が空なら deliveries の law_article から補完
+    for law in law_items:
+        if not law.get("relevant_articles"):
+            arts = [
+                d.get("law_article", "")
+                for d in law.get("deliveries", [])
+                if d.get("law_article", "")
+            ]
+            if arts:
+                law["relevant_articles"] = list(dict.fromkeys(arts))
 
     # Human in the loop: 結果レビュー
     interrupt({
