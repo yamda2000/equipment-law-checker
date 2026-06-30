@@ -108,6 +108,38 @@ class SynthesisResult(BaseModel):
     risk_count: RiskCount = Field(description="優先度別の法令件数")
 
 
+class RefineResult(BaseModel):
+    law_items: list[LawItem] = Field(description="文面修正後の法令別対応事項リスト")
+
+
+# ─── 再開（resume）デシジョン解析ヘルパー ────────────────────────────
+_REINVEST_PREFIXES = ("reinvestigate:", "reinvestigate：")
+_REFINE_PREFIXES   = ("refine:", "refine：")
+
+
+def _extract_after(decision, prefixes: tuple) -> str:
+    """「prefix: 本文」形式の resume 値から本文を取り出す。該当なしは空文字。"""
+    if isinstance(decision, str):
+        for p in prefixes:
+            if decision.startswith(p):
+                return decision.split(p, 1)[1].strip()
+    return ""
+
+
+def _is_reinvestigate(decision) -> bool:
+    return isinstance(decision, str) and any(
+        decision.startswith(p) for p in _REINVEST_PREFIXES
+    )
+
+
+def _merge_note(existing: str, extra: str) -> str:
+    extra = (extra or "").strip()
+    existing = existing or ""
+    if not extra:
+        return existing
+    return f"{existing}\n{extra}".strip() if existing else extra
+
+
 # ─── ヒアリングツール定義（OpenAI/Azure 形式）────────────────────
 COMPLETE_HEARING_TOOL = {
     "type": "function",
@@ -186,7 +218,7 @@ def analysis_node(state: AppState) -> dict:
     ])
 
     # Human in the loop: 方針レビュー
-    interrupt({
+    decision = interrupt({
         "phase":            "policy_review",
         "equipment_info":   info,
         "issues":           result.issues,
@@ -196,13 +228,21 @@ def analysis_node(state: AppState) -> dict:
         "analysis_summary": result.analysis_summary,
     })
 
-    # 再開後
+    # 再開後: 担当者の追記（「approved: <追記>」形式）を抽出して調査に反映する
+    policy_note = ""
+    if isinstance(decision, str):
+        for prefix in ("approved:", "approved："):
+            if decision.startswith(prefix):
+                policy_note = decision.split(prefix, 1)[1].strip()
+                break
+
     return {
         "messages":       [AIMessage("調査方針が承認されました。e-Gov API で法令を調査します...")],
         "issues":         result.issues,
         "unknown_items":  result.unknown_items,
         "search_keywords": result.search_keywords,
         "search_plan":    result.search_plan,
+        "policy_note":    policy_note,
         "phase":          "searching",
     }
 
@@ -242,9 +282,17 @@ def search_node(state: AppState) -> dict:
     equipment_info   = state.get("equipment_info", {})
     issues           = state.get("issues", [])
     initial_keywords = state.get("search_keywords", [])
+    policy_note      = state.get("policy_note", "")
 
-    results: list[dict] = []
+    # 再調査ループ時は前回の検索結果を引き継ぎ、新規分を上乗せする
+    prev_results: list[dict] = state.get("search_results", []) or []
+    results: list[dict] = list(prev_results)
     seen_titles: set[str] = set()
+    for _r in prev_results:
+        _t = _r.get("title", "")
+        if _t:
+            seen_titles.add(_t)
+            seen_titles.add(_t + _r.get("url", ""))
     search_log: list[str] = []
     progress_messages: list = []
     failed_queries: set[str] = set()  # 0件だったクエリを記録
@@ -317,8 +365,14 @@ def search_node(state: AppState) -> dict:
         history_str  = "\n".join(search_log) if search_log else "（なし）"
         results_str  = "\n".join(
             f"- {r.get('title','?')} ({r.get('source','?')})"
+            + (f"\n    概要: {r.get('snippet','')[:150]}" if r.get('snippet') else "")
             for r in results[:25]
         ) if results else "（なし）"
+
+        note_str = (
+            f"\n\n## 🔔 担当者からの追記指示（最優先で考慮し、関連する検索を追加すること）\n{policy_note}"
+            if policy_note else ""
+        )
 
         failed_str = "\n".join(f"- {q}" for q in failed_queries) if failed_queries else "なし"
         context = (
@@ -328,6 +382,7 @@ def search_node(state: AppState) -> dict:
             f"## 検索履歴（{iteration + 1}回目判断）\n{history_str}\n\n"
             f"## ⚠️ 0件だったクエリ（再検索禁止）\n{failed_str}\n\n"
             f"## 取得済み法令・情報（{len(results)}件）\n{results_str}"
+            f"{note_str}"
         )
 
         action: SearchAction = search_llm.invoke([
@@ -399,14 +454,17 @@ def synthesis_node(state: AppState) -> dict:
     equipment_info = state.get("equipment_info", {})
     search_results = state.get("search_results", [])
     issues         = state.get("issues", [])
+    policy_note    = state.get("policy_note", "")
 
     context = (
         f"【設備情報】\n{json.dumps(equipment_info, ensure_ascii=False, indent=2)}\n\n"
         f"【確認が必要な論点】\n{json.dumps(issues, ensure_ascii=False)}\n\n"
-        f"【e-Gov・Web 調査結果（抜粋）】\n"
+        + (f"【担当者からの追記指示（最優先で反映）】\n{policy_note}\n\n" if policy_note else "")
+        + f"【e-Gov・Web 調査結果（抜粋）】\n"
         + "\n".join(
             f"- {r.get('title','?')} ({r.get('source','?')})"
-            for r in search_results[:15]
+            + (f"\n  概要: {r.get('snippet','')[:300]}" if r.get('snippet') else "")
+            for r in search_results[:18]
         )
     )
 
@@ -459,24 +517,75 @@ def synthesis_node(state: AppState) -> dict:
                 law["relevant_articles"] = list(dict.fromkeys(arts))
 
     # Human in the loop: 結果レビュー
-    interrupt({
+    decision = interrupt({
         "phase":      "results_review",
         "law_items":  law_items,
         "summary":    result.summary,
         "risk_count": result.risk_count.model_dump(),
     })
 
+    # 再開後: 「足りない・再調査して」依頼なら検索フェーズに戻す
+    if _is_reinvestigate(decision):
+        extra = _extract_after(decision, _REINVEST_PREFIXES)
+        return {
+            "messages":   [AIMessage(f"担当者から追加調査の依頼を受けました：{extra}\n再調査を実施します...")],
+            "law_items":  law_items,
+            "policy_note": _merge_note(state.get("policy_note", ""), extra),
+            "issues":     list(state.get("issues", []) or []) + [f"【追加調査依頼】{extra}"],
+            "phase":      "searching",
+        }
+
+    # 通常: レポートへ。case_id をここで確定し、以降の再実行でも不変にする
+    case_id = state.get("case_id") or (
+        f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
+    )
     return {
         "messages":  [AIMessage("レビュー完了。レポートを生成します...")],
         "law_items": law_items,
+        "case_id":   case_id,
         "phase":     "reporting",
     }
 
 
+# ─── 文面修正（LLM）ヘルパー ──────────────────────────────────────
+def _refine_law_items(law_items: list, equipment_info: dict, instruction: str) -> list:
+    """担当者の文面修正依頼に沿って law_items のテキストを LLM で調整する。
+    法令名・条番号・届出先などの事実情報は依頼が無い限り変えない。
+    失敗時は元の law_items を返す。"""
+    if not law_items:
+        return law_items
+    refine_llm = _llm(max_tokens=16000).with_structured_output(RefineResult)
+    ctx = (
+        f"【設備情報】\n{json.dumps(equipment_info, ensure_ascii=False, indent=2)}\n\n"
+        f"【現在の法令別対応事項(JSON)】\n{json.dumps(law_items, ensure_ascii=False, indent=2)}\n\n"
+        f"【担当者からの文面修正依頼】\n{instruction}\n\n"
+        "上記の依頼に沿って law_items の文面（applicability / item / deadline / responsible など）"
+        "を読みやすく修正してください。法令名・条番号(relevant_articles, law_article)・"
+        "届出先(authority)・priority などの事実情報は、依頼で明示されない限り変更しないこと。"
+    )
+    try:
+        res: RefineResult = refine_llm.invoke([SystemMessage(SYNTHESIS_SYSTEM), HumanMessage(ctx)])
+        refined = [it.model_dump() for it in res.law_items]
+    except Exception:
+        return law_items
+
+    # LawItem スキーマに無い law_id / law_revision_id を法令名で再付与（条文リンク維持）
+    orig_by_name = {l.get("law_name", ""): l for l in law_items}
+    for it in refined:
+        o = orig_by_name.get(it.get("law_name", ""))
+        if o:
+            it["law_id"]          = o.get("law_id", "")
+            it["law_revision_id"] = o.get("law_revision_id", "")
+    return refined or law_items
+
+
 # ─── ノード: レポート生成 ──────────────────────────────────────────
 def report_node(state: AppState) -> dict:
-    """HTML レポートを生成。interrupt でレポートレビューを要求。"""
-    case_id = f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
+    """HTML レポートを生成。interrupt でレポートレビューを要求。
+    再開時の依頼に応じて 再調査(search へ) / 文面修正(report 再実行) / 承認(complete) に分岐する。"""
+    case_id = state.get("case_id") or (
+        f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
+    )
     report_html = generate_html_report(
         equipment_info=state.get("equipment_info", {}),
         law_items=state.get("law_items", []),
@@ -486,12 +595,37 @@ def report_node(state: AppState) -> dict:
     )
 
     # Human in the loop: レポートレビュー
-    interrupt({
+    decision = interrupt({
         "phase":       "report_review",
         "report_html": report_html,
         "case_id":     case_id,
     })
 
+    # ① 「足りない・再調査して」→ 検索フェーズに戻す
+    if _is_reinvestigate(decision):
+        extra = _extract_after(decision, _REINVEST_PREFIXES)
+        return {
+            "messages":    [AIMessage(f"レポート確認後、追加調査の依頼を受けました：{extra}\n再調査を実施します...")],
+            "policy_note": _merge_note(state.get("policy_note", ""), extra),
+            "issues":      list(state.get("issues", []) or []) + [f"【追加調査依頼】{extra}"],
+            "case_id":     case_id,
+            "phase":       "searching",
+        }
+
+    # ② 文面修正（LLM）→ law_items を更新し report を再実行して再確認させる
+    refine = _extract_after(decision, _REFINE_PREFIXES)
+    if refine:
+        new_items = _refine_law_items(
+            state.get("law_items", []), state.get("equipment_info", {}), refine
+        )
+        return {
+            "messages":  [AIMessage(f"レポート文面の修正依頼を受けました：{refine}\n修正して再生成します...")],
+            "law_items": new_items,
+            "case_id":   case_id,
+            "phase":     "reporting",
+        }
+
+    # ③ 承認 → 完了
     return {
         "messages": [AIMessage(
             "✅ レポートが承認されました。\n\n"
@@ -499,6 +633,7 @@ def report_node(state: AppState) -> dict:
             "レポートをダウンロードして、担当部署に共有してください。"
         )],
         "report_html": report_html,
+        "case_id":     case_id,
         "phase":       "complete",
     }
 
@@ -512,6 +647,21 @@ def _route_start(state: AppState) -> str:
         "synthesizing": "synthesis",
         "reporting":    "report",
     }.get(state.get("phase", "hearing"), "hearing")
+
+
+def _route_after_synthesis(state: AppState) -> str:
+    """結果確認の後段ルーティング。再調査依頼なら search、通常は report。"""
+    return "search" if state.get("phase") == "searching" else "report"
+
+
+def _route_after_report(state: AppState):
+    """レポート確認の後段ルーティング。"""
+    phase = state.get("phase", "complete")
+    if phase == "searching":
+        return "search"
+    if phase == "reporting":
+        return "report"
+    return END
 
 
 def build_workflow():
@@ -536,8 +686,17 @@ def build_workflow():
     })
     builder.add_edge("analysis",  "search")
     builder.add_edge("search",    "synthesis")
-    builder.add_edge("synthesis", "report")
-    builder.add_edge("report",    END)
+    # 結果確認で「再調査」依頼 → search に戻す。それ以外は report へ
+    builder.add_conditional_edges("synthesis", _route_after_synthesis, {
+        "search": "search",
+        "report": "report",
+    })
+    # レポート確認で 再調査 → search / 文面修正 → report再実行 / 承認 → END
+    builder.add_conditional_edges("report", _route_after_report, {
+        "search": "search",
+        "report": "report",
+        END:      END,
+    })
 
     memory = MemorySaver()
     return builder.compile(checkpointer=memory)

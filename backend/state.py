@@ -22,6 +22,9 @@ class AppState(TypedDict):
     search_keywords: list
     search_plan: str
 
+    # 方針確認で担当者が追記した指示（調査・統合に反映）
+    policy_note: str
+
     # 検索結果
     search_results: list
 
@@ -30,6 +33,7 @@ class AppState(TypedDict):
 
     # レポート
     report_html: str
+    case_id: str
 
     # エラー
     error: Optional[str]

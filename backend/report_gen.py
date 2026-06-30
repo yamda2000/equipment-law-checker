@@ -20,10 +20,18 @@ def generate_html_report(
     unknown_items: list,
     search_results: list,
     case_id: str = None,
+    feedback_note: str = "",
 ) -> str:
     """法令別アクションアイテムから HTML レポートを生成する"""
     now = datetime.now()
     case_id = case_id or f"EQ-{now.strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
+
+    feedback_html = (
+        f'<div style="background:#E3F2FD;border-left:4px solid #1565C0;padding:14px 18px;'
+        f'border-radius:6px;margin:16px 0;font-size:13px;color:#0D47A1;">'
+        f'<strong>📝 担当者からの補足・修正メモ</strong><br>{feedback_note}</div>'
+        if feedback_note else ""
+    )
 
     info_rows    = _build_info_rows(equipment_info)
     summary_html = _build_summary(law_items)
@@ -90,6 +98,8 @@ def generate_html_report(
   <tr><td>作成日時</td><td>{now.strftime('%Y年%m月%d日 %H:%M')}</td></tr>
   <tr><td>調査対象</td><td>横浜市内会社施設</td></tr>
 </table>
+
+{feedback_html}
 
 <h2>📋 設備情報</h2>
 <table class="info-table">{info_rows}</table>
