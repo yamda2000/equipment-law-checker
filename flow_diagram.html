@@ -1,0 +1,421 @@
+<title>法令確認AI 処理フロー図</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #1d2530;
+    --ink-soft: #5a6474;
+    --line: #d8dde5;
+    --ai: #2e4fb8;          /* AI処理（自動） */
+    --ai-bg: #eef1fb;
+    --ai-line: #b9c4ea;
+    --human: #9a6400;       /* 担当者の確認・入力 */
+    --human-bg: #fdf3dd;
+    --human-line: #e4c98c;
+    --store: #0e7c66;       /* 保存データ */
+    --store-bg: #e9f5f1;
+    --store-line: #a9d5c9;
+    --loop: #8a4f9e;        /* 戻り・ループ */
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161d; --card: #1a2029; --ink: #e5eaf2; --ink-soft: #98a3b3;
+      --line: #313947;
+      --ai: #8fa6ee; --ai-bg: #1d2436; --ai-line: #3a4666;
+      --human: #e2b463; --human-bg: #2a2317; --human-line: #57462a;
+      --store: #6cc9b4; --store-bg: #16261f; --store-line: #2c4a40;
+      --loop: #c79ad6;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161d; --card: #1a2029; --ink: #e5eaf2; --ink-soft: #98a3b3;
+    --line: #313947;
+    --ai: #8fa6ee; --ai-bg: #1d2436; --ai-line: #3a4666;
+    --human: #e2b463; --human-bg: #2a2317; --human-line: #57462a;
+    --store: #6cc9b4; --store-bg: #16261f; --store-line: #2c4a40;
+    --loop: #c79ad6;
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #1d2530; --ink-soft: #5a6474;
+    --line: #d8dde5;
+    --ai: #2e4fb8; --ai-bg: #eef1fb; --ai-line: #b9c4ea;
+    --human: #9a6400; --human-bg: #fdf3dd; --human-line: #e4c98c;
+    --store: #0e7c66; --store-bg: #e9f5f1; --store-line: #a9d5c9;
+    --loop: #8a4f9e;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Noto Sans JP", Meiryo, sans-serif;
+    line-height: 1.7;
+    margin: 0;
+    padding: 40px 16px 72px;
+  }
+  .page { max-width: 860px; margin: 0 auto; }
+
+  header h1 {
+    font-size: 26px; font-weight: 700; margin: 0 0 4px; letter-spacing: .02em;
+    text-wrap: balance;
+  }
+  header .sub { color: var(--ink-soft); font-size: 13.5px; margin: 0 0 28px; }
+
+  /* ── 凡例 ── */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 10px 22px;
+    padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); font-size: 12.5px; margin-bottom: 36px;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-soft); }
+  .key { width: 14px; height: 14px; border-radius: 4px; flex: none; }
+  .key.ai    { background: var(--ai-bg);    border: 1.5px solid var(--ai); }
+  .key.human { background: var(--human-bg); border: 1.5px solid var(--human); }
+  .key.store { background: var(--store-bg); border: 1.5px solid var(--store); }
+  .key.loop  { border: none; height: 0; border-top: 2px dashed var(--loop); border-radius: 0; }
+
+  /* ── 全体サマリー ── */
+  .overview {
+    border: 1px solid var(--line); border-radius: 10px; background: var(--card);
+    padding: 18px 20px 14px; margin-bottom: 44px;
+  }
+  .overview h2 { font-size: 13px; margin: 0 0 12px; color: var(--ink-soft); letter-spacing: .08em; }
+  .ov-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 4px; font-size: 12.5px; }
+  .ov-chip {
+    padding: 3px 10px; border-radius: 999px; white-space: nowrap;
+    background: var(--ai-bg); border: 1px solid var(--ai-line); color: var(--ai); font-weight: 600;
+  }
+  .ov-chip.human { background: var(--human-bg); border-color: var(--human-line); color: var(--human); }
+  .ov-arrow { color: var(--ink-soft); padding: 0 2px; }
+  .ov-loops { margin: 12px 0 0; font-size: 12px; color: var(--loop); }
+  .ov-loops li { margin: 2px 0; }
+
+  /* ── フローノード ── */
+  .flow { display: flex; flex-direction: column; align-items: stretch; }
+  .node {
+    border-radius: 10px; padding: 16px 20px 14px;
+    border: 1.5px solid var(--ai-line); background: var(--card);
+    border-left: 5px solid var(--ai);
+  }
+  .node.human { border-color: var(--human-line); border-left-color: var(--human); }
+  .node.store-node { border-color: var(--store-line); border-left-color: var(--store); }
+
+  .node-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px; margin-bottom: 6px; }
+  .step-no { font-size: 12px; font-weight: 700; color: var(--ink-soft); letter-spacing: .06em; }
+  .node-title { font-size: 16.5px; font-weight: 700; }
+  .badge {
+    font-size: 11px; font-weight: 700; padding: 1px 9px; border-radius: 999px; letter-spacing: .04em;
+  }
+  .badge.ai    { color: var(--ai);    background: var(--ai-bg);    border: 1px solid var(--ai-line); }
+  .badge.human { color: var(--human); background: var(--human-bg); border: 1px solid var(--human-line); }
+  .code { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); }
+
+  .node ul { margin: 6px 0 4px; padding-left: 20px; font-size: 13.5px; }
+  .node li { margin: 3px 0; }
+  .node li b { font-weight: 700; }
+
+  /* 分岐チップ */
+  .outcomes { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .oc {
+    font-size: 12px; padding: 4px 12px; border-radius: 6px; font-weight: 600;
+    background: var(--ai-bg); border: 1px solid var(--ai-line); color: var(--ai);
+  }
+  .oc.back { background: transparent; border: 1.5px dashed var(--loop); color: var(--loop); }
+
+  /* 接続線 */
+  .conn { display: flex; flex-direction: column; align-items: center; padding: 2px 0; }
+  .conn .stem { width: 2px; height: 22px; background: var(--line); }
+  .conn .tip {
+    width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent;
+    border-top: 8px solid var(--line);
+  }
+  .conn .lbl { font-size: 11.5px; color: var(--ink-soft); padding: 1px 0 3px; }
+
+  /* 調査実施の内部構造 */
+  .inner { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+  .stage {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px;
+    background: color-mix(in srgb, var(--card) 60%, var(--bg));
+    font-size: 13px;
+  }
+  .stage-head { font-weight: 700; font-size: 13px; margin-bottom: 2px; }
+  .stage-head .code { margin-left: 8px; }
+  .stage ul { margin: 4px 0 2px; padding-left: 18px; }
+  .stage li { margin: 2px 0; }
+
+  .subagent {
+    margin-top: 8px; border: 1.5px dashed var(--ai-line); border-radius: 8px;
+    padding: 8px 14px; background: var(--ai-bg); font-size: 12.5px;
+  }
+  .subagent .stage-head { color: var(--ai); }
+  .subagent ol { margin: 4px 0 2px; padding-left: 20px; }
+  .subagent li { margin: 2px 0; }
+
+  /* メモリ・データストア */
+  .stores { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 46px; }
+  @media (max-width: 640px) { .stores { grid-template-columns: 1fr; } }
+  .store-card {
+    border: 1.5px solid var(--store-line); border-left: 5px solid var(--store);
+    border-radius: 10px; background: var(--card); padding: 14px 18px;
+  }
+  .store-card h3 { font-size: 14.5px; margin: 0 0 2px; color: var(--store); }
+  .store-card .code { display: block; margin-bottom: 6px; }
+  .store-card dl { margin: 6px 0 2px; font-size: 12.5px; }
+  .store-card dt { font-weight: 700; color: var(--ink-soft); font-size: 11.5px; letter-spacing: .05em; margin-top: 6px; }
+  .store-card dd { margin: 1px 0 0; }
+
+  .section-h { font-size: 15px; font-weight: 700; margin: 46px 0 4px; }
+  .section-note { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 10px; }
+
+  footer { margin-top: 48px; font-size: 11.5px; color: var(--ink-soft); border-top: 1px solid var(--line); padding-top: 12px; }
+</style>
+
+<div class="page">
+<header>
+  <h1>法令確認・届出施設確認AI — 処理フロー図</h1>
+  <p class="sub">設備導入時の法令・手続き確認を7フェーズで進める LangGraph ワークフロー。担当者確認（Human-in-the-loop）は3箇所＋資料確認。</p>
+</header>
+
+<div class="legend">
+  <span><i class="key ai"></i>AI処理（自動）</span>
+  <span><i class="key human"></i>担当者の確認・入力</span>
+  <span><i class="key store"></i>保存データ（次回以降に活用）</span>
+  <span><i class="key loop"></i>戻り・ループ</span>
+</div>
+
+<div class="overview">
+  <h2>全体サマリー</h2>
+  <div class="ov-strip">
+    <span class="ov-chip human">0. 資料アップロード</span><span class="ov-arrow">→</span>
+    <span class="ov-chip">1. ヒアリング</span><span class="ov-arrow">→</span>
+    <span class="ov-chip">2. 情報整理・分析</span><span class="ov-arrow">→</span>
+    <span class="ov-chip human">3. 調査方針確認</span><span class="ov-arrow">→</span>
+    <span class="ov-chip">4. 調査実施</span><span class="ov-arrow">→</span>
+    <span class="ov-chip">5. 結果統合</span><span class="ov-arrow">→</span>
+    <span class="ov-chip human">5′. 調査結果確認</span><span class="ov-arrow">→</span>
+    <span class="ov-chip human">6. レポート確認</span><span class="ov-arrow">→</span>
+    <span class="ov-chip">7. 完了</span>
+  </div>
+  <ul class="ov-loops">
+    <li>↺ 調査結果確認・レポート確認で「再調査依頼」→ 4. 調査実施へ戻る</li>
+    <li>↺ レポート確認で「文面修正」→ 6. レポートを再生成して再確認</li>
+    <li>↺ 7. 完了時にケースメモリへ保存 → 次回案件の 2. 分析で想起（学習ループ）</li>
+  </ul>
+</div>
+
+<div class="flow">
+
+  <div class="node human">
+    <div class="node-head">
+      <span class="step-no">STEP 0</span>
+      <span class="node-title">開始・資料アップロード（任意）</span>
+      <span class="badge human">担当者</span>
+      <span class="code">app.py: start_with_documents / render_extract_confirm</span>
+    </div>
+    <ul>
+      <li>仕様書・提案書などをアップロード（PDF / Word / Excel / PowerPoint / テキスト）</li>
+      <li>AIがヒアリング11項目に該当する情報だけを構造化抽出（根拠付き）</li>
+      <li><b>担当者が確認画面で修正・確定</b>。記入済み項目は再質問されない</li>
+      <li>資料なしの場合はそのまま通常ヒアリングへ</li>
+    </ul>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="lbl">確定した項目＋未記入項目リスト</div><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node">
+    <div class="node-head">
+      <span class="step-no">STEP 1</span>
+      <span class="node-title">ヒアリング</span>
+      <span class="badge ai">AI</span>
+      <span class="code">workflow.py: hearing_node</span>
+    </div>
+    <ul>
+      <li>未記入の項目だけを<b>1項目ずつ</b>質問（回答例つき）。「不明・未定」も回答として受付</li>
+      <li>担当者の回答 ⇄ 次の質問 を全11項目が揃うまで繰り返し</li>
+      <li><b>完了ガード</b>: 未記入のまま完了しようとした場合は却下し、質問を続けさせる</li>
+    </ul>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="lbl">equipment_info（11項目）</div><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node">
+    <div class="node-head">
+      <span class="step-no">STEP 2</span>
+      <span class="node-title">情報整理・分析</span>
+      <span class="badge ai">AI</span>
+      <span class="code">workflow.py: analysis_node</span>
+    </div>
+    <ul>
+      <li>🧠 <b>ケースメモリ想起</b>: 類似の承認済み過去案件（最大2件）を検索して参考情報に</li>
+      <li>確認が必要な論点（issues）／不明情報の影響（unknown_items）を整理</li>
+      <li>e-Gov 検索キーワード（6〜10個）と調査方針を作成</li>
+    </ul>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node human">
+    <div class="node-head">
+      <span class="step-no">STEP 3</span>
+      <span class="node-title">調査方針確認</span>
+      <span class="badge human">担当者確認</span>
+      <span class="code">workflow.py: policy_review_node（interrupt）</span>
+    </div>
+    <ul>
+      <li>論点・調査方針・検索キーワードを画面で確認</li>
+      <li>追記があれば「approved: 追記内容」として調査・統合に最優先で反映</li>
+    </ul>
+    <div class="outcomes"><span class="oc">承認 → STEP 4 へ</span></div>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node">
+    <div class="node-head">
+      <span class="step-no">STEP 4</span>
+      <span class="node-title">調査実施（Agentic Search）</span>
+      <span class="badge ai">AI</span>
+      <span class="code">workflow.py: search_node</span>
+    </div>
+    <div class="inner">
+      <div class="stage">
+        <div class="stage-head">4-1. シード検索（決定的・必ず実行）</div>
+        <ul>
+          <li>e-Gov 法令API: AI分析キーワード＋ルールベース必須法令</li>
+          <li>Web: 横浜市・神奈川県の条例／省庁ガイドライン・FAQ</li>
+          <li>社内文書: 設備の社内手続き・基準（登録されている場合）</li>
+        </ul>
+      </div>
+      <div class="stage">
+        <div class="stage-head">4-2. Agentic ループ（最大20検索）</div>
+        <ul>
+          <li>毎回 LLM が判断: <b>収集完了？</b>（done）／ 次に何をどのツールで調べるか</li>
+          <li>ツール: <b>egov</b>（法令名検索）・<b>web</b>（手続き・条例）・<b>internal</b>（社内文書）</li>
+          <li>検索済みクエリの再実行はスキップ（3連続で新規提案がなければ終了）</li>
+        </ul>
+        <div class="subagent">
+          <div class="stage-head">internal 選択時 → Agentic RAG サブエージェント<span class="code">rag_agent.py</span></div>
+          <ol>
+            <li>論点から検索クエリを2〜3個に展開（multi-query）</li>
+            <li>ベクトル検索でチャンク取得（Chroma / FAISS）</li>
+            <li>関連チャンクの選別と充足判断（reflection）</li>
+            <li>不足なら追加クエリで再検索（最大3ラウンド）→ 関連チャンクだけを返す</li>
+          </ol>
+        </div>
+      </div>
+      <div class="stage">
+        <div class="stage-head">4-3. 網羅性検証</div>
+        <ul>
+          <li>論点ごとに対応情報が集まったか最終チェック（LLM自己申告とは独立）</li>
+          <li>未カバー論点は補完検索（最大5件）。それでも残れば結果確認・レポートに明示</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="lbl">search_results（e-Gov・Web・社内文書）</div><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node">
+    <div class="node-head">
+      <span class="step-no">STEP 5</span>
+      <span class="node-title">結果統合</span>
+      <span class="badge ai">AI</span>
+      <span class="code">workflow.py: synthesis_node</span>
+    </div>
+    <ul>
+      <li>法令ごとに「適用理由・届出・申請・社内対応・優先度」を整理</li>
+      <li>主要11法令領域は<b>該当 or 非該当（理由つき）</b>のどちらかに必ず振り分け（確認漏れ防止）</li>
+      <li><b>条番号グラウンディング</b>: e-Gov 原文の条一覧と照合し、実在しない条番号を除去</li>
+    </ul>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node human">
+    <div class="node-head">
+      <span class="step-no">STEP 5′</span>
+      <span class="node-title">調査結果確認</span>
+      <span class="badge human">担当者確認</span>
+      <span class="code">workflow.py: results_review_node（interrupt）</span>
+    </div>
+    <ul>
+      <li>法令別の対応事項・非該当理由・未カバー論点を確認</li>
+    </ul>
+    <div class="outcomes">
+      <span class="oc">承認 → STEP 6 レポート生成へ</span>
+      <span class="oc back">再調査依頼 ↺ STEP 4 へ戻る（依頼内容を論点に追加）</span>
+    </div>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node human">
+    <div class="node-head">
+      <span class="step-no">STEP 6</span>
+      <span class="node-title">レポート作成・確認</span>
+      <span class="badge human">担当者確認</span>
+      <span class="code">workflow.py: report_node（interrupt）／report_gen.py</span>
+    </div>
+    <ul>
+      <li>HTML レポートを生成（条文全文・章見出し・非該当法令・免責事項つき）</li>
+    </ul>
+    <div class="outcomes">
+      <span class="oc">承認 → STEP 7 完了へ</span>
+      <span class="oc back">文面修正 ↺ 修正して再生成・再確認</span>
+      <span class="oc back">再調査依頼 ↺ STEP 4 へ戻る</span>
+    </div>
+  </div>
+
+  <div class="conn"><div class="stem"></div><div class="tip"></div></div>
+
+  <div class="node store-node">
+    <div class="node-head">
+      <span class="step-no">STEP 7</span>
+      <span class="node-title">完了・ケースメモリ保存</span>
+      <span class="badge ai">AI</span>
+      <span class="code">case_memory.py: save_case</span>
+    </div>
+    <ul>
+      <li>レポートをダウンロードして担当部署へ共有</li>
+      <li>🧠 承認済みの結論（設備プロファイル・該当法令・非該当判断）を<b>事例として自動保存</b></li>
+      <li>次回の類似案件の STEP 2 で想起される → <b>使うほど賢くなる学習ループ（CBR）</b></li>
+    </ul>
+  </div>
+
+</div>
+
+<h2 class="section-h">保存データ（案件をまたいで蓄積・活用）</h2>
+<p class="section-note">どちらも <span class="code">internal_docs_index/</span> に永続化。埋め込みは LLM_MODE（poc=OpenAI / prod=Azure）、ストアは VECTOR_STORE（chroma=既定 / faiss）で切替。</p>
+
+<div class="stores">
+  <div class="store-card">
+    <h3>社内文書ベクトルストア</h3>
+    <span class="code">backend/tools/internal_docs.py</span>
+    <dl>
+      <dt>登録（事前・任意）</dt>
+      <dd>サイドバー「📁 社内文書」から社内規定・基準・過去の届出事例をアップロード → チャンク分割・埋め込み</dd>
+      <dt>利用</dt>
+      <dd>STEP 4 のシード検索＋Agentic RAG サブエージェントが検索</dd>
+      <dt>管理</dt>
+      <dd>一覧表示・個別削除・全削除（重複はハッシュで自動スキップ）</dd>
+    </dl>
+  </div>
+  <div class="store-card">
+    <h3>ケースメモリ（CBR / 事例ベース推論）</h3>
+    <span class="code">backend/case_memory.py</span>
+    <dl>
+      <dt>保存（自動）</dt>
+      <dd>STEP 7 のレポート承認時。承認済みの結論だけが蓄積されるため誤学習しにくい</dd>
+      <dt>想起（自動）</dt>
+      <dd>STEP 2 で新案件の設備プロファイルと類似検索 → 分析LLMの参考情報に注入</dd>
+      <dt>管理</dt>
+      <dd>サイドバー「🧠 ケースメモリ」で一覧・個別削除</dd>
+    </dl>
+  </div>
+</div>
+
+<footer>
+  ワークフロー実装: backend/workflow.py（LangGraph・MemorySaver チェックポイント）／ UI: app.py（Streamlit）。
+  担当者確認の3箇所（STEP 3・5′・6）は LangGraph の interrupt で一時停止し、承認・依頼の入力で再開する。
+</footer>
+</div>
