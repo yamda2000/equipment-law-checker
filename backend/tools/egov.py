@@ -4,6 +4,7 @@ API仕様: https://laws.e-gov.go.jp/api/2/swagger-ui
 """
 
 import re
+import base64
 import requests
 from xml.etree import ElementTree as ET
 
@@ -153,47 +154,131 @@ def _search_by_fulltext(keyword: str, max_results: int) -> list[dict]:
         return []
 
 
-# ─── キーワードマッピング ──────────────────────────────────────────
+# ─── ルールベース法令チェックリスト（決定的ベースライン） ─────────
+# 設備属性 → 必ず確認する法令のマトリクス。
+# LLMの分析キーワードとマージして必ず検索し、LLMの発想漏れによる確認漏れを防ぐ。
+# 値が「なし」と明言された場合のみ非該当。「不明」「未定」は安全側（該当しうる）に倒す。
 EQUIPMENT_KEYWORD_MAP = {
-    "chemicals_あり": [
+    "chemicals": [
         "有機溶剤中毒予防規則",
         "特定化学物質障害予防規則",
         "危険物の規制に関する政令",
-        "化学物質等の危険性又は有害性等の表示又は通知等の促進に関する指針",
+        "毒物及び劇物取締法",
+        "高圧ガス保安法",
     ],
-    "fire_exhaust_あり": [
-        "大気汚染防止法",
-        "揮発性有機化合物の排出抑制に関する法律",
+    "fire_exhaust": [
         "消防法",
+        "大気汚染防止法",
+        "粉じん障害予防規則",
     ],
-    "wastewater_あり": [
+    "wastewater": [
         "水質汚濁防止法",
         "下水道法",
+        "廃棄物の処理及び清掃に関する法律",
     ],
-    "radiation_あり": [
-        "放射線障害防止法",
-        "医療法",
-        "労働安全衛生法",
+    "noise_vibration": [
+        "騒音規制法",
+        "振動規制法",
     ],
-    "construction_あり": [
+    "radiation": [
+        "放射性同位元素等の規制に関する法律",
+        "電離放射線障害防止規則",
+    ],
+    "construction": [
         "建築基準法",
         "消防法",
+        "電気事業法",
     ],
 }
 
+# 設備情報の記述内容（全項目の値）に対するキーワードトリガー
+_VALUE_KEYWORD_TRIGGERS: list[tuple] = [
+    (re.compile(r"冷媒|フロン|R\d{2,3}[A-Za-z]?|冷凍|チラー"),
+     ["フロン排出抑制法", "冷凍保安規則", "高圧ガス保安法"]),
+    (re.compile(r"ボイラー|圧力容器"),
+     ["ボイラー及び圧力容器安全規則"]),
+    (re.compile(r"クレーン|ホイスト|巻上げ"),
+     ["クレーン等安全規則"]),
+    (re.compile(r"粉じん|研磨|グラインダ|切削粉|サンドブラスト"),
+     ["粉じん障害予防規則"]),
+    (re.compile(r"燃料|灯油|軽油|ガソリン|重油|LPG|都市ガス"),
+     ["消防法", "危険物の規制に関する政令"]),
+]
+
+# 常に確認する基本法令
+_BASE_KEYWORDS = ["労働安全衛生法", "消防法"]
+
+_NEGATIVE_VALUES = ("なし", "無し", "特になし")
+
+
+def _is_potentially_applicable(val) -> bool:
+    """「なし」と明言された場合のみ False。「不明」「未定」や具体的記載は
+    安全側（該当しうる＝True）に倒す。空欄は判断材料がないため False。"""
+    s = str(val or "").strip()
+    if not s:
+        return False
+    return not any(
+        s == n or s.startswith(n + "（") or s.startswith(n + "。")
+        for n in _NEGATIVE_VALUES
+    )
+
 
 def get_suggested_keywords(equipment_info: dict) -> list[str]:
-    """設備情報から推奨検索キーワードを返す"""
-    keywords = set(["労働安全衛生法", "消防法"])
-    for field, candidates in EQUIPMENT_KEYWORD_MAP.items():
-        key, val = field.rsplit("_", 1)
-        if val in str(equipment_info.get(key, "")):
-            keywords.update(candidates)
-    return list(keywords)
+    """設備情報から必ず確認すべき法令キーワードを返す（ルールベース・決定的）。
+    LLMの判断を介さないため、設備属性に対応する法令の検索が保証される。"""
+    keywords = list(_BASE_KEYWORDS)
+    for field, laws in EQUIPMENT_KEYWORD_MAP.items():
+        if _is_potentially_applicable(equipment_info.get(field)):
+            keywords.extend(laws)
+    all_text = " ".join(str(v) for v in equipment_info.values())
+    for pat, laws in _VALUE_KEYWORD_TRIGGERS:
+        if pat.search(all_text):
+            keywords.extend(laws)
+    return list(dict.fromkeys(keywords))
 
 
 # 法令XMLのインメモリキャッシュ（law_id → XML文字列）
 _LAW_XML_CACHE: dict[str, str] = {}
+
+
+def _get_law_xml(law_id: str, law_revision_id: str = "") -> str:
+    """e-Gov API から法令XML文字列を取得する（キャッシュ付き）。失敗時は空文字。
+    /law_data/{id} は law_full_text_format=xml 指定時、Base64エンコードされた
+    XML文字列を返す。"""
+    cache_key = law_revision_id or law_id
+    xml_str = _LAW_XML_CACHE.get(cache_key)
+    if xml_str:
+        return xml_str
+
+    # 試行するIDの優先順（revision_id → law_id）
+    candidates = []
+    if law_revision_id:
+        candidates.append(law_revision_id)
+    if law_id and law_id not in candidates:
+        candidates.append(law_id)
+
+    for try_id in candidates:
+        try:
+            resp = _SESSION.get(
+                f"{EGOV_BASE_V2}/law_data/{try_id}",
+                params={"law_full_text_format": "xml"},
+                timeout=20,
+            )
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            raw = resp.json().get("law_full_text", "")
+            if isinstance(raw, str) and raw:
+                if raw.lstrip().startswith("<"):
+                    xml_str = raw          # 素のXMLで返ってきた場合
+                else:
+                    xml_str = base64.b64decode(raw).decode("utf-8")
+            if xml_str:
+                _LAW_XML_CACHE[cache_key] = xml_str
+                return xml_str
+        except Exception:
+            continue
+    return ""
 
 
 def fetch_article_text(law_id: str, article_refs: list[str],
@@ -206,42 +291,157 @@ def fetch_article_text(law_id: str, article_refs: list[str],
     if not law_id:
         return {}
 
-    cache_key = law_revision_id or law_id
-    xml_str = _LAW_XML_CACHE.get(cache_key)
-    if not xml_str:
-        # 試行するエンドポイントIDの優先順（revision_id → law_id → law_id plural）
-        candidates = []
-        if law_revision_id:
-            candidates.append(law_revision_id)
-        candidates.append(law_id)
-
-        for try_id in candidates:
-            for path in [f"{EGOV_BASE_V2}/law/{try_id}",
-                         f"{EGOV_BASE_V2}/laws/{try_id}"]:
-                try:
-                    resp = _SESSION.get(path, timeout=15)
-                    if resp.status_code == 404:
-                        continue
-                    resp.raise_for_status()
-                    data = resp.json()
-                    xml_str = (
-                        data.get("law_full_text", {}).get("xml", "")
-                        or data.get("law", {}).get("law_body", {}).get("xml", "")
-                        or data.get("xml", "")
-                        or ""
-                    )
-                    if xml_str:
-                        _LAW_XML_CACHE[cache_key] = xml_str
-                        break
-                except Exception:
-                    continue
-            if xml_str:
-                break
-
+    xml_str = _get_law_xml(law_id, law_revision_id)
     if not xml_str:
         return {}   # エラーではなく空を返す → 表示側でリンクを出す
 
     return _extract_articles(xml_str, article_refs)
+
+
+def fetch_article_captions(law_id: str, article_refs: list[str],
+                           law_revision_id: str = "") -> dict[str, str]:
+    """
+    指定条番号の条見出し（ArticleCaption、例：（建築確認））を取得する。
+    戻り値: {"第6条": "（建築確認）", ...}  見出しが無い条・失敗時は含めない
+    """
+    if not law_id or not article_refs:
+        return {}
+
+    xml_str = _get_law_xml(law_id, law_revision_id)
+    if not xml_str:
+        return {}
+
+    try:
+        xml_clean = re.sub(r' xmlns[^"]*"[^"]*"', "", xml_str)
+        root = ET.fromstring(xml_clean)
+    except ET.ParseError:
+        return {}
+
+    # Num属性 → 条見出しのマップを一度だけ構築。
+    # 附則（SupplProvision）にも同じ条番号があるため、最初の出現（本則）を優先する
+    # （_find_article_text の最初マッチ採用と同じ挙動）
+    caption_by_num: dict[str, str] = {}
+    for article in root.iter("Article"):
+        num = article.get("Num", "").lstrip("0") or article.get("num", "")
+        cap = article.find("ArticleCaption")
+        if num and num not in caption_by_num and cap is not None:
+            cap_text = _elem_text(cap)
+            if cap_text:
+                caption_by_num[num] = cap_text
+
+    results: dict[str, str] = {}
+    for ref in article_refs:
+        art_match = re.search(r'第(\d+)条(?:の(\d+))?', ref)
+        if not art_match:
+            continue
+        art_num = art_match.group(1)
+        if art_match.group(2):
+            art_num += f"_{art_match.group(2)}"
+        cap = caption_by_num.get(art_num)
+        if cap:
+            results[ref] = cap
+    return results
+
+
+def normalize_article_ref(ref: str) -> str:
+    """条番号文字列を「第◯条」「第◯条の◯」「第◯条第◯項」形式に正規化する。
+    LLM由来の見出し・説明語句（例：「第30条（危険又は有害な業務の調査等）」）は取り除く。
+    条番号が読み取れない場合（「第○章」「条文番号不明」等）は空文字を返す。
+    """
+    m = re.search(r'第(\d+)条((?:の\d+)*)\s*(?:第(\d+)項)?', ref or "")
+    if not m:
+        return ""
+    out = f"第{m.group(1)}条{m.group(2)}"
+    if m.group(3):
+        out += f"第{m.group(3)}項"
+    return out
+
+
+def article_sort_key(ref: str) -> list:
+    """条番号の昇順ソート用キーを返す。
+    「第6条」→ [6]、「第28条の2」→ [28, 2]、「第10条第1項」→ [10, 0, ..., 1]。
+    条番号は法令の章立て順に振られているため、このキーで並べると
+    章順・条順の表示になる。読み取れない場合は末尾に回す。
+    """
+    s = re.sub(r"（[^）]*）", "", ref or "").strip()
+    m = re.match(r"第(\d+)条((?:の\d+)*)\s*(?:第(\d+)項)?", s)
+    if not m:
+        return [float("inf")]
+    key = [int(m.group(1))] + [int(n) for n in re.findall(r"の(\d+)", m.group(2))]
+    # 「の◯」の枝番なし（=0扱い）と項番号を末尾に付け、桁数を揃えて比較する
+    key += [0] * (3 - len(key))
+    key.append(int(m.group(3)) if m.group(3) else 0)
+    return key
+
+
+def fetch_article_list(law_id: str, law_revision_id: str = "") -> list[dict]:
+    """法令XMLから本則の全条番号と見出しの一覧を取得する。
+    戻り値: [{"ref": "第28条の2", "caption": "（危険性又は有害性等の調査）"}, ...]
+    見出しが無い条は caption を空文字にする。失敗時は空リスト。
+    附則の重複条番号は本則（最初の出現）を優先する。
+    """
+    if not law_id:
+        return []
+    xml_str = _get_law_xml(law_id, law_revision_id)
+    if not xml_str:
+        return []
+    try:
+        xml_clean = re.sub(r' xmlns[^"]*"[^"]*"', "", xml_str)
+        root = ET.fromstring(xml_clean)
+    except ET.ParseError:
+        return []
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for article in root.iter("Article"):
+        num = article.get("Num", "").lstrip("0") or article.get("num", "")
+        if not num or num in seen:
+            continue
+        seen.add(num)
+        # Num属性 "28_2" → 「第28条の2」
+        parts = num.split("_")
+        if not parts[0].isdigit():
+            continue
+        ref = f"第{parts[0]}条" + "".join(f"の{p}" for p in parts[1:])
+        cap = article.find("ArticleCaption")
+        cap_text = _elem_text(cap) if cap is not None else ""
+        items.append({"ref": ref, "caption": cap_text})
+    return items
+
+
+def fetch_article_chapters(law_id: str, law_revision_id: str = "") -> dict[str, str]:
+    """条番号→その条が属する章タイトルのマップを取得する。
+    戻り値: {"第6条": "第二章　特定工場等に関する規制", ...}
+    章立てのない法令（短い政令・規則等）・取得失敗時は空 dict。
+    同じ条番号が複数章に現れることはないが、念のため最初の出現を優先する。
+    """
+    if not law_id:
+        return {}
+    xml_str = _get_law_xml(law_id, law_revision_id)
+    if not xml_str:
+        return {}
+    try:
+        xml_clean = re.sub(r' xmlns[^"]*"[^"]*"', "", xml_str)
+        root = ET.fromstring(xml_clean)
+    except ET.ParseError:
+        return {}
+
+    chapter_by_ref: dict[str, str] = {}
+    for chapter in root.iter("Chapter"):
+        title_elem = chapter.find("ChapterTitle")
+        title = _elem_text(title_elem) if title_elem is not None else ""
+        if not title:
+            continue
+        for article in chapter.iter("Article"):
+            num = article.get("Num", "").lstrip("0") or article.get("num", "")
+            if not num:
+                continue
+            parts = num.split("_")
+            if not parts[0].isdigit():
+                continue
+            ref = f"第{parts[0]}条" + "".join(f"の{p}" for p in parts[1:])
+            chapter_by_ref.setdefault(ref, title)
+    return chapter_by_ref
 
 
 def _extract_articles(xml_str: str, article_refs: list[str]) -> dict[str, str]:
@@ -253,17 +453,21 @@ def _extract_articles(xml_str: str, article_refs: list[str]) -> dict[str, str]:
         xml_clean = re.sub(r' xmlns[^"]*"[^"]*"', "", xml_str)
         root = ET.fromstring(xml_clean)
     except ET.ParseError:
-        return {"error": "XML解析エラー"}
+        # 解析失敗は「取得できなかった」扱いで空を返す（表示側でリンクを出す）
+        return {}
 
     results: dict[str, str] = {}
 
     for ref in article_refs:
-        # "第10条" → "10"、"第10条第1項" → article="10", para="1"
-        art_match = re.search(r'第(\d+)条', ref)
+        # "第10条" → "10"、"第11条の2" → "11_2"（XMLのNum属性形式）、
+        # "第10条第1項" → article="10", para="1"
+        art_match = re.search(r'第(\d+)条(?:の(\d+))?', ref)
         para_match = re.search(r'第(\d+)項', ref)
         if not art_match:
             continue
         art_num = art_match.group(1)
+        if art_match.group(2):
+            art_num += f"_{art_match.group(2)}"
         para_num = para_match.group(1) if para_match else None
 
         text = _find_article_text(root, art_num, para_num)
@@ -285,9 +489,9 @@ def _find_article_text(root: ET.Element, art_num: str, para_num: str | None) -> 
             for para in article.iter("Paragraph"):
                 pnum = para.get("Num", "").lstrip("0") or para.get("num", "")
                 if pnum == para_num:
-                    return _elem_text(para)
+                    return _article_text(para)
         else:
-            return _elem_text(article)
+            return _article_text(article)
 
     return ""
 
@@ -301,3 +505,54 @@ def _elem_text(elem: ET.Element) -> str:
         if node.tail and node.tail.strip():
             parts.append(node.tail.strip())
     return "".join(parts)
+
+
+# 条文整形: 番号ラベル要素（この後に全角スペースを入れる）
+_LABEL_TAGS = {
+    "ArticleTitle",     # 第五条
+    "ParagraphNum",     # ２（第1項は空）
+    "ItemTitle",        # 一
+    "Subitem1Title",    # イ
+    "Subitem2Title",
+    "Subitem3Title",
+}
+# 条文整形: ブロック要素（この前で改行する）
+_BLOCK_TAGS = {"Paragraph", "Item", "Subitem1", "Subitem2", "Subitem3"}
+
+
+def _article_text(elem: ET.Element) -> str:
+    """条・項のXMLを、法令の標準的な組版に合わせて整形したテキストで返す。
+    - 条見出し（…）の後は改行
+    - 条名「第五条」・項番号「２」・号番号「一」の後は全角スペース
+    - 項・号・イロハの区切りは改行
+    例:
+        （指定製品及び特定製品の管理者の責務）
+        第五条　指定製品の管理者は、…
+        ２　特定製品の管理者は、…
+    """
+    parts: list[str] = []
+
+    def walk(node: ET.Element) -> None:
+        # ブロックの前で改行する。ただし直前が「第五条　」等の番号ラベルなら
+        # 同じ行に続ける（第1項は条名と同一行に書くのが法令の組版）
+        if node.tag in _BLOCK_TAGS and parts and not parts[-1].endswith(("　", "\n")):
+            parts.append("\n")
+        if node.tag == "ArticleCaption":
+            t = _elem_text(node)
+            if t:
+                parts.append(t + "\n")
+            return
+        if node.tag in _LABEL_TAGS:
+            t = _elem_text(node)
+            if t:
+                parts.append(t + "　")
+            return
+        if node.text and node.text.strip():
+            parts.append(node.text.strip())
+        for child in node:
+            walk(child)
+            if child.tail and child.tail.strip():
+                parts.append(child.tail.strip())
+
+    walk(elem)
+    return "".join(parts).strip()

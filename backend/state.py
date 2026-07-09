@@ -21,15 +21,24 @@ class AppState(TypedDict):
     unknown_items: list
     search_keywords: list
     search_plan: str
+    analysis_summary: str
 
     # 方針確認で担当者が追記した指示（調査・統合に反映）
     policy_note: str
 
     # 検索結果
     search_results: list
+    # 実行済み検索クエリ（再調査ラウンドで同一クエリの再実行を防ぐ）
+    executed_queries: list
+    # 網羅性検証で「対応情報が見つからない」と判定された論点（担当者に明示）
+    uncovered_issues: list
 
     # 法令別アクションアイテム
     law_items: list  # LawItem の dict リスト
+    synthesis_summary: str
+    risk_count: dict
+    # 確認したが非該当と判断した法令（理由つき・確認漏れ防止のため明示）
+    excluded_laws: list
 
     # レポート
     report_html: str

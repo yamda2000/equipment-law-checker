@@ -2,16 +2,41 @@
 
 from datetime import datetime
 import json
+import re
 import uuid
 import urllib.parse
 
-from backend.tools.egov import fetch_article_text
+from backend.tools.egov import (
+    fetch_article_text, fetch_article_captions, fetch_article_chapters,
+    article_sort_key,
+)
 
 
 PRIORITY_CONFIG = {
     "required": {"label": "🔴 必須対応", "color": "#FFEBEE", "border": "#C62828"},
     "check":    {"label": "🟡 要確認",   "color": "#FFFDE7", "border": "#F57F17"},
 }
+
+# LLM出力に英字の内部フィールド名が混ざった場合の表示用置換
+_FIELD_NAME_JA = {
+    "equipment_type":     "設備種別",
+    "installation_place": "設置場所",
+    "operation_purpose":  "用途・目的",
+    "scheduled_date":     "稼働開始予定",
+    "chemicals":          "薬品・ガス",
+    "fire_exhaust":       "火気・排気・粉じん",
+    "wastewater":         "排水・廃棄物",
+    "noise_vibration":    "騒音・振動",
+    "radiation":          "放射線・X線",
+    "construction":       "建屋改修",
+    "additional_info":    "その他情報",
+}
+
+
+def _to_ja_fields(text: str) -> str:
+    for en, ja in _FIELD_NAME_JA.items():
+        text = str(text).replace(en, f"「{ja}」")
+    return text
 
 
 def generate_html_report(
@@ -21,6 +46,8 @@ def generate_html_report(
     search_results: list,
     case_id: str = None,
     feedback_note: str = "",
+    excluded_laws: list = None,
+    uncovered_issues: list = None,
 ) -> str:
     """法令別アクションアイテムから HTML レポートを生成する"""
     now = datetime.now()
@@ -33,11 +60,13 @@ def generate_html_report(
         if feedback_note else ""
     )
 
-    info_rows    = _build_info_rows(equipment_info)
-    summary_html = _build_summary(law_items)
-    law_html     = _build_law_items(law_items)
-    unknown_html = _build_unknown_items(unknown_items)
-    law_refs     = _build_law_refs(search_results)
+    info_rows      = _build_info_rows(equipment_info)
+    summary_html   = _build_summary(law_items)
+    law_html       = _build_law_items(law_items)
+    unknown_html   = _build_unknown_items(unknown_items)
+    law_refs       = _build_law_refs(search_results)
+    uncovered_html = _build_uncovered_issues(uncovered_issues or [])
+    excluded_html  = _build_excluded_laws(excluded_laws or [])
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -107,8 +136,12 @@ def generate_html_report(
 <h2>📊 対応サマリー</h2>
 {summary_html}
 
+{uncovered_html}
+
 <h2>⚖️ 法令別 届出・対応事項</h2>
 {law_html}
+
+{excluded_html}
 
 {f'<h2>⚠️ 不明・未定情報（追加確認タスク）</h2>{unknown_html}' if unknown_items else ''}
 
@@ -139,8 +172,8 @@ def _build_info_rows(info: dict) -> str:
         "operation_purpose":  "用途・目的",
         "scheduled_date":     "稼働開始予定",
         "chemicals":          "薬品・ガス",
-        "fire_exhaust":       "火気・排気",
-        "wastewater":         "排水",
+        "fire_exhaust":       "火気・排気・粉じん",
+        "wastewater":         "排水・廃棄物",
         "noise_vibration":    "騒音・振動",
         "radiation":          "放射線・X線",
         "construction":       "建屋改修",
@@ -195,14 +228,57 @@ def _build_article_block(law: dict) -> str:
     # error キーは表示対象外
     article_texts = {k: v for k, v in (article_texts or {}).items() if k != "error"}
 
+    # 条見出し（例：（建築確認））をe-Govから取得（XMLはキャッシュ済みのため通常は即時）
+    captions: dict = {}
+    if law_id and relevant_articles:
+        try:
+            captions = fetch_article_captions(law_id, relevant_articles, law_revision_id)
+        except Exception:
+            captions = {}
+
+    # 条番号→章タイトルのマップ（章立てのない法令は空 dict → 従来通りの平坦表示）
+    chapters: dict = {}
+    if law_id and relevant_articles:
+        try:
+            chapters = fetch_article_chapters(law_id, law_revision_id)
+        except Exception:
+            chapters = {}
+
+    def _with_caption(a: str) -> str:
+        # 見出しは e-Gov 取得分（本物）のみ表示する。
+        # 旧データに残る LLM 由来の（）付き見出しは信頼できないため取り除く
+        base = re.sub(r"（[^）]*）", "", a).strip()
+        return base + captions.get(base, captions.get(a, ""))
+
     def _art_link(a: str) -> str:
+        a = _with_caption(a)
         if law_id:
             return (f'<a href="https://laws.e-gov.go.jp/law/{law_id}" target="_blank" '
                     f'style="color:#1565C0;text-decoration:underline;">{a}</a>')
         return f'<span style="color:#1565C0;">{a}</span>'
 
-    art_str = "　".join(_art_link(a) for a in relevant_articles) \
-        if relevant_articles else '<span style="color:#888;">条番号確認中</span>'
+    def _chapter_of(a: str) -> str:
+        # "第28条の2第1項（見出し）" → "第28条の2" に正規化して章を引く
+        m = re.match(r"第\d+条(?:の\d+)*", re.sub(r"（[^）]*）", "", a).strip())
+        return chapters.get(m.group(0), "") if m else ""
+
+    if not relevant_articles:
+        art_str = '<span style="color:#888;">条番号確認中</span>'
+    elif any(_chapter_of(a) for a in relevant_articles):
+        # 条番号の昇順に並べてから章ごとにグルーピング表示
+        # （条番号は章立て順に振られているため、章も昇順に並ぶ）
+        _groups: dict = {}
+        for a in sorted(relevant_articles, key=article_sort_key):
+            _groups.setdefault(_chapter_of(a), []).append(a)
+        art_str = "".join(
+            '<div style="margin:2px 0;">'
+            + (f'<div style="font-size:12px;color:#555;font-weight:700;">【{ch}】</div>' if ch else "")
+            + '<div style="padding-left:1em;">' + "　".join(_art_link(a) for a in arts) + "</div>"
+            + "</div>"
+            for ch, arts in _groups.items()
+        )
+    else:
+        art_str = "　".join(_art_link(a) for a in relevant_articles)
     auth_str = "　/　".join(authorities) if authorities else '<span style="color:#888;">―</span>'
 
     summary_card = (
@@ -218,14 +294,31 @@ def _build_article_block(law: dict) -> str:
         f'</div>'
     )
 
-    if article_texts:
-        art_rows = "".join(
-            f'<div style="margin-bottom:10px;">'
-            f'<div style="font-size:12px;font-weight:700;color:#1565C0;margin-bottom:3px;">{ref}</div>'
-            f'<div style="font-size:12px;color:#333;line-height:1.75;white-space:pre-wrap;">{text}</div>'
-            f'</div>'
-            for ref, text in article_texts.items()
-        )
+    # 現在の relevant_articles に含まれる条番号だけを、条番号の昇順で表示する
+    art_pairs = [
+        (a, article_texts[a])
+        for a in sorted(relevant_articles, key=article_sort_key)
+        if a in article_texts
+    ]
+    if art_pairs:
+        # 条番号カードと同様に、章が変わる位置に章見出しを挿入する
+        _rows: list = []
+        _last_ch = None
+        for ref, text in art_pairs:
+            _ch = _chapter_of(ref)
+            if _ch and _ch != _last_ch:
+                _rows.append(
+                    f'<div style="font-size:12px;color:#555;font-weight:700;'
+                    f'margin:6px 0 4px;">【{_ch}】</div>'
+                )
+            _last_ch = _ch
+            _rows.append(
+                f'<div style="margin-bottom:10px;">'
+                f'<div style="font-size:12px;font-weight:700;color:#1565C0;margin-bottom:3px;">{_with_caption(ref)}</div>'
+                f'<div style="font-size:12px;color:#333;line-height:1.75;white-space:pre-wrap;">{text}</div>'
+                f'</div>'
+            )
+        art_rows = "".join(_rows)
         article_box = (
             f'<div style="background:#F8F9FA;border-left:3px solid #1565C0;'
             f'border-radius:0 4px 4px 0;padding:10px 14px;margin:10px 0;">'
@@ -301,6 +394,45 @@ def _build_law_items(law_items: list) -> str:
   {'<div class="section-label">🏢 社内対応事項</div>' + internal_html if internal_html else ''}
 </div>"""
     return html
+
+
+def _build_uncovered_issues(items: list) -> str:
+    """網羅性検証で対応情報が見つからなかった論点。担当者による手動確認を促す。"""
+    if not items:
+        return ""
+    rows = "".join(
+        f'<li style="margin-bottom:6px;line-height:1.6;">{_to_ja_fields(item)}</li>' for item in items
+    )
+    return (
+        f'<h2 style="color:#C62828;border-left-color:#C62828;">🚨 対応法令を確認できなかった論点</h2>'
+        f'<div style="background:#FFEBEE;border:1px solid #EF9A9A;border-left:5px solid #C62828;'
+        f'border-radius:6px;padding:14px 18px;font-size:13px;">'
+        f'<strong>以下の論点は、AI調査（e-Gov・Web検索）で対応する法令・情報を確認できませんでした。</strong><br>'
+        f'確認漏れ・届出漏れを防ぐため、<strong>担当部署・所轄機関への直接確認</strong>を行ってください。'
+        f'<ul style="margin:10px 0 0;padding-left:20px;">{rows}</ul>'
+        f'</div>'
+    )
+
+
+def _build_excluded_laws(items: list) -> str:
+    """確認したうえで非該当と判断した法令の一覧。判断根拠のレビューを可能にする。"""
+    if not items:
+        return ""
+    rows = "".join(
+        f'<tr><td style="white-space:nowrap;font-weight:600;">{e.get("law_name", "")}</td>'
+        f'<td>{_to_ja_fields(e.get("reason", ""))}</td></tr>'
+        for e in items
+    )
+    return (
+        f'<h2>🚫 確認のうえ非該当と判断した法令</h2>'
+        f'<div style="font-size:12px;color:#666;margin-bottom:8px;">'
+        f'以下は調査対象としたうえで「適用なし」と判断した法令です。'
+        f'判断理由（根拠となる設備情報）に誤りがないかご確認ください。'
+        f'前提となる設備情報が変わった場合は再調査が必要です。</div>'
+        f'<table class="info-table">'
+        f'<tr><td style="width:30%;">法令名</td><td>非該当と判断した理由</td></tr>{rows}'
+        f'</table>'
+    )
 
 
 def _build_unknown_items(items: list) -> str:

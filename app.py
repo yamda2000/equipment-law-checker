@@ -5,8 +5,11 @@
 
 import os
 import re
+import html as html_lib
 import uuid
 import sys
+import logging
+import traceback
 import urllib.parse
 import streamlit as st
 import streamlit.components.v1 as components
@@ -15,15 +18,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.types import Command
 
 from backend.workflow import (
-    workflow, get_interrupt_data, get_all_messages, get_state_value
+    workflow, get_interrupt_data, get_all_messages, get_state_value,
+    HEARING_COMPLETE_MARKER,
 )
-from backend.tools.egov import fetch_article_text
+from backend.tools.egov import (
+    fetch_article_text, fetch_article_captions, fetch_article_chapters,
+    article_sort_key,
+)
+from backend.doc_intake import extract_text_from_file, extract_equipment_info
+from backend.tools.internal_docs import (
+    list_registered as list_internal_docs,
+    ingest_files as ingest_internal_docs,
+    delete_file as delete_internal_doc,
+    delete_all as delete_all_internal_docs,
+)
+from backend.case_memory import list_cases, delete_case
 
 # ─────────────────────────────────────────
 # ページ設定
@@ -36,6 +54,13 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+/* アプリを80%サイズで表示する。
+   body に zoom をかけると Streamlit の 100vh 基準の高さ計算とズレて
+   画面下部が描画されなくなるため、スクロール領域内のコンテンツ
+   コンテナ（メイン・サイドバー）にのみ適用する */
+.block-container { zoom: 0.8; }
+section[data-testid="stSidebar"] > div { zoom: 0.8; }
+
 .stApp { background-color: #f5f7fa; }
 
 .ai-bubble {
@@ -90,15 +115,29 @@ st.markdown("""
     margin: 4px 0; font-size: 13px;
     box-shadow: 0 1px 3px rgba(0,0,0,.07);
 }
+
+/* 再実行中の残存（stale）ボタンを不可視にする。
+   重い処理（調査・レポート生成）の間、前サイクルの確認ボタン等が
+   薄い色で数分残り続ける・誤クリックされるのを防ぐ。
+   display:none で要素全体を消すとページの高さが潰れてスクロール位置が
+   先頭に飛ぶため、visibility でレイアウトを保ったまま隠す。 */
+div[data-stale="true"] button { visibility: hidden !important; }
+
+/* メイン領域の下パディングを詰める（入力欄の下に広い空白ができるのを防ぐ） */
+.block-container { padding-bottom: 2rem !important; }
+
+/* 入力欄の英語ヒント（Press Enter to submit form 等）を非表示 */
+div[data-testid="InputInstructions"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────
 # 定数
 # ─────────────────────────────────────────
-PHASES = ["1. ヒアリング", "2. 情報整理", "3. 調査方針確認", "4. 調査実施", "5. 調査結果確認", "6. レポート作成", "7. 完了確認"]
+PHASES = ["1. ヒアリング", "2. 情報整理・分析", "3. 調査方針確認", "4. 調査実施", "5. 調査結果確認", "6. レポート作成", "7. 完了確認"]
 
-PHASE_ICONS = ["💬", "📊", "📋", "🔍", "✅", "📄", "🎉"]
+# ステップ5は完了マーク（✅）と紛らわしいため「確認」を表す 👀 を使う
+PHASE_ICONS = ["💬", "📊", "📋", "🔍", "👀", "📄", "🎉"]
 
 PHASE_INDEX = {
     "hearing": 0, "analysis": 1, "policy_review": 2,
@@ -112,12 +151,26 @@ EQUIPMENT_LABELS = {
     "operation_purpose":  ("🎯", "用途・目的"),
     "scheduled_date":     ("📅", "稼働予定"),
     "chemicals":          ("🧪", "薬品・ガス"),
-    "fire_exhaust":       ("🔥", "火気・排気"),
-    "wastewater":         ("💧", "排水"),
+    "fire_exhaust":       ("🔥", "火気・排気・粉じん"),
+    "wastewater":         ("💧", "排水・廃棄物"),
     "noise_vibration":    ("📢", "騒音・振動"),
     "radiation":          ("☢️", "放射線・X線"),
     "construction":       ("🏗️", "建屋改修"),
 }
+
+# 内部フィールド名 → 日本語項目名（LLM出力に英字内部名が混ざった場合の表示用置換）
+FIELD_NAME_JA = {key: label for key, (_icon, label) in EQUIPMENT_LABELS.items()}
+FIELD_NAME_JA["additional_info"] = "その他の情報"
+
+# ヒアリング11項目（表示・確認フォームの順序）
+HEARING_FIELDS = list(EQUIPMENT_LABELS.keys()) + ["additional_info"]
+
+
+def to_ja_field_names(text: str) -> str:
+    """LLM出力中の英字内部フィールド名（operation_purpose 等）を日本語項目名に置換する。"""
+    for en, ja in FIELD_NAME_JA.items():
+        text = text.replace(en, f"「{ja}」")
+    return text
 
 
 
@@ -127,13 +180,16 @@ EQUIPMENT_LABELS = {
 def init():
     defaults = {
         "thread_id":        str(uuid.uuid4()),
-        "ui_phase":         "start",   # start | hearing | interrupt | complete
+        "ui_phase":         "start",   # start | confirm_extract | hearing | interrupt | complete
         "interrupt_data":   None,
         "step_idx":         0,         # 現在のステップ番号（0〜6）
         "review_decisions": {},
         "report_html":      "",
         "display_messages": [],
         "msg_count":        0,         # 表示済みメッセージ数（重複防止）
+        "extracted_info":   None,      # 資料から抽出した設備情報（確認前）
+        "extract_failed_files": [],    # テキスト抽出できなかったファイル名
+        "expected_questions": 11,      # AIが質問する残り項目数（資料確定分だけ減る）
         "api_key_ok":       bool(
             os.getenv("POC_LLM_API_KEY") or os.getenv("PROD_LLM_API_KEY")
         ),
@@ -181,7 +237,9 @@ def _process_new_msgs(old_count: int, skip_human: bool = True):
                 add_display("search_log", m.content)
             else:
                 add_display("ai", m.content)
-        elif isinstance(m, ToolMessage):
+        elif isinstance(m, ToolMessage) and HEARING_COMPLETE_MARKER in str(m.content):
+            # ヒアリング完了の ToolMessage のみ対象。complete_hearing 却下時の
+            # 差し戻し ToolMessage では情報整理バナーを出さない
             add_step_banner(1)
             add_display("system", "AIがヒアリング情報を分析し、調査方針を作成しました。調査方針をご確認ください。")
             st.session_state.step_idx = 1   # ステップ2: 情報整理
@@ -201,22 +259,43 @@ def _save_phase_idata(idata: dict):
 # ─────────────────────────────────────────
 # LangGraph 呼び出し（ヒアリング中）
 # ─────────────────────────────────────────
+def _rollback_predicted_analysis():
+    """11問カウントの予測で先行表示した「2. 情報整理」バナー・ステップを取り消す。
+    （AIが聞き直しや挨拶を挟んでカウントがずれた場合の自己修復）"""
+    msgs = st.session_state.display_messages
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "step_banner":
+            if msgs[i].get("step") == 1:
+                msgs.pop(i)
+            break
+    if st.session_state.step_idx == 1:
+        st.session_state.step_idx = 0
+
+
 def invoke_hearing(user_text: str):
     old_count = st.session_state.msg_count
     config = get_config()
 
-    # AIの質問が11件揃っていれば次のinvokeでヒアリング完了→情報整理に移行する
+    # AIの質問が残り項目数（資料からの確定分だけ減る。全問手入力なら11）に
+    # 達していれば、次のinvokeでヒアリング完了→情報整理に移行する
     ai_count = sum(1 for m in st.session_state.display_messages if m.get("role") == "ai")
-    hearing_ending = ai_count >= 11
+    hearing_ending = ai_count >= st.session_state.get("expected_questions", 11)
     # 処理中の表示はスピナーのみ（バナーを直接描画すると入力フォームの下に
     # 割り込んで表示が崩れるため）。完了後の rerun で会話フロー内の正しい
     # 位置にステップバナーが表示される。
 
-    with st.spinner("情報整理中..." if hearing_ending else "AIが考えています..."):
-        workflow.invoke(
-            {"messages": [HumanMessage(content=user_text)]},
-            config=config,
-        )
+    try:
+        with st.spinner("情報整理・分析中..." if hearing_ending else "AIが考えています..."):
+            workflow.invoke(
+                {"messages": [HumanMessage(content=user_text)]},
+                config=config,
+            )
+    except Exception:
+        logger.error("invoke_hearing でエラー:\n%s", traceback.format_exc())
+        add_display("system", "⚠️ AIとの通信でエラーが発生しました。お手数ですが、同じ内容をもう一度送信してください。")
+        if not get_state_value(st.session_state.thread_id, "hearing_complete"):
+            _rollback_predicted_analysis()
+        return
 
     _process_new_msgs(old_count, skip_human=True)
 
@@ -227,18 +306,142 @@ def invoke_hearing(user_text: str):
         st.session_state.step_idx = PHASE_INDEX.get(idata.get("phase", ""), 1)
         add_step_banner(st.session_state.step_idx)
         _save_phase_idata(idata)
-    # hearing 継続中はステップ変更なし
+    elif not get_state_value(st.session_state.thread_id, "hearing_complete"):
+        # ヒアリング継続中：カウント予測が外れて先行表示した
+        # 「2. 情報整理」バナーがあれば取り消す（workflow の状態を一次情報源にする）
+        _rollback_predicted_analysis()
+
+
+# ─────────────────────────────────────────
+# 資料アップロード → 抽出 → 確認
+# ─────────────────────────────────────────
+def start_hearing_plain():
+    """資料なしの通常ヒアリングを開始する。"""
+    add_step_banner(0)
+    add_display("user", "法令確認・届出施設確認を開始します。")
+    st.session_state.step_idx = 0
+    invoke_hearing("法令確認・届出施設確認を開始します。設備情報のヒアリングをお願いします。")
+    st.session_state.ui_phase = "hearing"
+    st.rerun()
+
+
+def start_with_documents(files) -> bool:
+    """アップロード資料からテキストを抽出し、LLMで11項目を構造化抽出して
+    確認画面（confirm_extract）へ進む。1件も抽出できなければ False を返す
+    （呼び出し側で通常ヒアリングにフォールバックする）。"""
+    doc_texts, failed = [], []
+    extracted = None
+    with st.spinner("📄 資料から設備情報を抽出中...（資料が多いと1分程度かかります）"):
+        for f in files:
+            text = extract_text_from_file(f.name, f.getvalue())
+            if text.strip():
+                doc_texts.append((f.name, text))
+            else:
+                failed.append(f.name)
+        if doc_texts:
+            try:
+                extracted = extract_equipment_info(doc_texts)
+            except Exception:
+                logger.error("資料からの情報抽出でエラー:\n%s", traceback.format_exc())
+
+    st.session_state.extract_failed_files = failed
+    if extracted:
+        st.session_state.extracted_info = extracted
+        st.session_state.ui_phase = "confirm_extract"
+        return True
+    return False
+
+
+def render_extract_confirm():
+    """資料から抽出した11項目をユーザーに確認・修正してもらう画面。"""
+    info = st.session_state.extracted_info or {}
+    failed = st.session_state.get("extract_failed_files") or []
+    if failed:
+        st.warning(
+            "⚠️ 次のファイルはテキストを抽出できませんでした（スキャン画像のPDF等）："
+            + "、".join(failed)
+        )
+
+    filled_count = sum(
+        1 for k in HEARING_FIELDS if (info.get(k) or {}).get("value", "").strip()
+    )
+    st.markdown(
+        f'<div class="system-bubble">📄 資料から設備情報を抽出しました'
+        f'（{filled_count} / {len(HEARING_FIELDS)}項目）。'
+        f'内容が正しいか確認し、誤りがあれば修正してください。<br>'
+        f'<b>空欄のままの項目は、この後AIが1項目ずつ質問します。</b>'
+        f'（各項目の ❓ アイコンで資料の根拠を確認できます）</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("extract_confirm_form"):
+        values = {}
+        for key in HEARING_FIELDS:
+            icon, label = EQUIPMENT_LABELS.get(key, ("📝", FIELD_NAME_JA[key]))
+            field = info.get(key) or {}
+            evidence = field.get("evidence", "")
+            help_text = (
+                f"資料の根拠：{evidence}" if evidence
+                else "資料に記載が見つかりませんでした（空欄のままだとAIが質問します）"
+            )
+            values[key] = st.text_input(
+                f"{icon} {label}",
+                value=field.get("value", ""),
+                help=help_text,
+                key=f"extract_{key}",
+            )
+        submitted = st.form_submit_button(
+            "✅　この内容で確定してヒアリングを開始する",
+            type="primary", use_container_width=True,
+        )
+    if submitted:
+        confirm_extracted_and_start(values)
+
+
+def confirm_extracted_and_start(values: dict):
+    """確認・修正済みの抽出情報を確定情報としてAIに渡し、
+    未記入の項目だけを質問するヒアリングを開始する。"""
+    filled = {k: v.strip() for k, v in values.items() if v.strip()}
+    missing = [k for k in HEARING_FIELDS if k not in filled]
+    # AIが質問するのは未記入項目のみ（完了予測・スピナー表示に使う）
+    st.session_state.expected_questions = len(missing)
+
+    lines = [f"・{FIELD_NAME_JA[k]}：{filled.get(k, '（未記入）')}" for k in HEARING_FIELDS]
+    listing = "\n".join(lines)
+
+    add_step_banner(0)
+    add_display("user", "資料から抽出した設備情報を確認・確定しました。\n" + listing)
+    st.session_state.step_idx = 0
+    st.session_state.ui_phase = "hearing"
+
+    if not missing:
+        # 全項目確定済み：質問なしで complete_hearing → 情報整理まで一気に進む
+        st.session_state.step_idx = 1
+        add_step_banner(1)
+
+    prompt = (
+        "法令確認・届出施設確認を開始します。\n"
+        "以下は関連資料から抽出し、担当者が確認・修正した設備情報です。\n"
+        "値が記載されている項目は確定情報として扱い、再質問しないでください。\n"
+        f"「（未記入）」の項目が{len(missing)}件あります。そのすべてについて、"
+        "1項目ずつ質問して回答を得てください。\n"
+        "全項目の回答が揃うまで complete_hearing を呼ばないでください。\n"
+        "すべて記入済みの場合のみ、質問せず直ちに complete_hearing を呼び出してください。\n\n"
+        + listing
+    )
+    invoke_hearing(prompt)
+    st.rerun()
 
 
 def submit_hearing_answer(user_text: str):
     """ヒアリングの回答送信を一元処理する。
-    11問目の回答（次が情報整理）のときは、重い処理に入る前に一旦
+    最終問の回答（次が情報整理）のときは、重い処理に入る前に一旦
     サイドバー・バナーをステップ2に更新してから rerun し、次サイクルで
     情報整理を実行する。これにより「情報整理中」の間もサイドバー・バナーが
     ステップ2を正しく表示する。"""
     add_display("user", user_text)
     ai_count = sum(1 for m in st.session_state.display_messages if m.get("role") == "ai")
-    if ai_count >= 11:
+    if ai_count >= st.session_state.get("expected_questions", 11):
         # 情報整理フェーズへ移行：先に画面表示を更新してから処理する
         st.session_state.step_idx = 1
         add_step_banner(1)
@@ -251,6 +454,18 @@ def submit_hearing_answer(user_text: str):
 # ─────────────────────────────────────────
 # LangGraph 呼び出し（interrupt 再開）
 # ─────────────────────────────────────────
+def _rollback_resume_banner(current_phase: str):
+    """再開処理の失敗時、先行表示した「実行中」バナー（調査実施/レポート作成）を
+    取り消し、ステップ表示を元の確認フェーズに戻す。"""
+    msgs = st.session_state.display_messages
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "step_banner":
+            if msgs[i].get("step") in (3, 5):
+                msgs.pop(i)
+            break
+    st.session_state.step_idx = PHASE_INDEX.get(current_phase, st.session_state.step_idx)
+
+
 def resume_graph(decision):
     old_count = st.session_state.msg_count
     config = get_config()
@@ -280,14 +495,23 @@ def resume_graph(decision):
                     status.update(label=f"AI調査中... {entry}")
                     status.write(entry)
         except Exception as e:
+            logger.error("調査フェーズ (workflow.stream) でエラー:\n%s", traceback.format_exc())
             status.update(label="⚠️ 調査中にエラーが発生しました", state="error", expanded=True)
             status.write(str(e))
-            raise
+            add_display("system", "⚠️ 調査中にエラーが発生しました。もう一度お試しください。")
+            _rollback_resume_banner(current_phase)
+            return
         else:
             status.update(label="✅ AI調査が完了しました", state="complete", expanded=False)
     else:
-        with st.spinner("処理中..."):
-            workflow.invoke(Command(resume=decision), config=config)
+        try:
+            with st.spinner("処理中..."):
+                workflow.invoke(Command(resume=decision), config=config)
+        except Exception:
+            logger.error("処理フェーズ (workflow.invoke) でエラー:\n%s", traceback.format_exc())
+            add_display("system", "⚠️ 処理中にエラーが発生しました。もう一度お試しください。")
+            _rollback_resume_banner(current_phase)
+            return
 
     _process_new_msgs(old_count, skip_human=False)
 
@@ -347,8 +571,15 @@ def render_step_banner():
 # メッセージ描画
 # ─────────────────────────────────────────
 def render_messages():
-    shown_details: set = set()  # 詳細の二重描画防止（再調査でバナーが複数になっても1回）
-    for msg in st.session_state.display_messages:
+    msgs = st.session_state.display_messages
+    # 各ステップの「最後の」バナー位置を求める。詳細はそこにだけアンカー表示する
+    # （再調査ループで同じステップのバナーが複数あっても、最新の位置に表示される）
+    last_banner_pos: dict = {}
+    for i, m in enumerate(msgs):
+        if m.get("role") == "step_banner":
+            last_banner_pos[m["step"]] = i
+
+    for pos, msg in enumerate(msgs):
         role = msg["role"]
 
         if role == "step_banner":
@@ -359,32 +590,31 @@ def render_messages():
                 f'<div class="phase-banner">{icon}　{name}</div>',
                 unsafe_allow_html=True,
             )
-            # 各フェーズの詳細を、そのバナー直下に常時アンカー表示する
-            # （後続フェーズに進んでも消えず・移動せず、ここに固定される）
+            # 各フェーズの詳細を、そのステップの最後のバナー直下に常時アンカー表示する
+            # （後続フェーズに進んでも消えず、再調査後は最新バナーの下に移動する）
+            if last_banner_pos.get(idx) != pos:
+                continue
             phase = (st.session_state.interrupt_data or {}).get("phase", "")
-            if idx == 2 and "policy" not in shown_details \
-                    and st.session_state.get("policy_idata"):
+            if idx == 2 and st.session_state.get("policy_idata"):
                 # 3. 調査方針確認 の直下：調査方針の内容（方針確認中のみ展開）
                 render_policy_detail(
                     st.session_state.policy_idata,
                     expanded=(phase == "policy_review"),
                 )
-                shown_details.add("policy")
-            elif idx == 4 and "results" not in shown_details \
-                    and st.session_state.get("results_idata"):
+            elif idx == 4 and st.session_state.get("results_idata"):
                 # 5. 調査結果確認 の直下：調査結果の詳細
                 render_results_detail(st.session_state.results_idata)
-                shown_details.add("results")
             continue
 
         if role == "search_log":
             st.markdown(
-                f'<div class="search-log-bubble">{msg["content"]}</div>',
+                f'<div class="search-log-bubble">{html_lib.escape(msg["content"])}</div>',
                 unsafe_allow_html=True,
             )
             continue
 
-        content = msg["content"].replace("\n", "<br>")
+        # HTMLエスケープしてから改行・太字のみ変換（入力に <, > 等が含まれても崩れない）
+        content = html_lib.escape(msg["content"]).replace("\n", "<br>")
         content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', content)
         t       = msg["time"]
         if role == "ai":
@@ -433,14 +663,31 @@ def render_input():
             st.error(f"⚠️ {key_name} が設定されていません。`.env` ファイルを作成してAPIキーを設定してください。")
             st.code("copy .env.example .env\n# .env を編集して LLM_MODE と API キーを設定")
             return
-        st.info("👇 「開始する」を押すと、AIが設備情報のヒアリングを開始します。")
+        st.info(
+            "👇 仕様書・設備リストなどの関連資料があればアップロードしてください。"
+            "AIが資料から設備情報を抽出し、ヒアリングでの手入力を減らせます。"
+            "資料がなくてもそのまま開始できます。"
+        )
+        files = st.file_uploader(
+            "関連資料（PDF / Word / Excel / PowerPoint / テキスト・複数可）",
+            type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
+            accept_multiple_files=True,
+        )
         if st.button("▶️　法令確認・届出施設確認を開始する", type="primary", use_container_width=True):
-            add_step_banner(0)
-            add_display("user", "法令確認・届出施設確認を開始します。")
-            st.session_state.step_idx = 0
-            invoke_hearing("法令確認・届出施設確認を開始します。設備情報のヒアリングをお願いします。")
-            st.session_state.ui_phase = "hearing"
-            st.rerun()
+            if files:
+                if start_with_documents(files):
+                    st.rerun()
+                # 全ファイルの抽出に失敗：通常ヒアリングにフォールバック
+                add_display(
+                    "system",
+                    "⚠️ 資料から設備情報を抽出できなかったため（スキャン画像のPDF等）、"
+                    "通常のヒアリングを開始します。",
+                )
+            start_hearing_plain()
+
+    # ── 資料抽出結果の確認 ──
+    elif ui == "confirm_extract":
+        render_extract_confirm()
 
     # ── ヒアリング中 ──
     elif ui == "hearing":
@@ -452,9 +699,10 @@ def render_input():
             st.rerun()
 
         with st.form("hearing_form", clear_on_submit=True):
-            txt = st.text_input(
+            txt = st.text_area(
                 "AIへの回答を入力してください",
                 placeholder="こちらに記入してください。",
+                height=80,
             )
             submitted = st.form_submit_button("送信 ➤", type="primary", use_container_width=True)
             if submitted and txt.strip():
@@ -506,15 +754,15 @@ def render_policy_detail(idata: dict, expanded: bool = True):
     """調査方針確認の内容（分析概要・調査項目・不明情報・調査方針）を描画。
     ボタンは含まない。expanded=False で再掲（折りたたみ）表示にする。"""
     with st.expander("📋 ヒアリング情報の分析結果概要", expanded=expanded):
-        st.write(idata.get("analysis_summary", ""))
+        st.write(to_ja_field_names(idata.get("analysis_summary", "")))
 
     with st.expander("🔍 調査が必要な項目", expanded=expanded):
         for issue in idata.get("issues", []):
-            st.write(f"● {issue}")
+            st.write(f"● {to_ja_field_names(issue)}")
 
     if idata.get("unknown_items"):
         items_html = "".join(
-            f'<li style="margin-bottom:7px;line-height:1.65;">{u}</li>'
+            f'<li style="margin-bottom:7px;line-height:1.65;">{html_lib.escape(to_ja_field_names(u))}</li>'
             for u in idata["unknown_items"]
         )
         st.markdown(
@@ -531,7 +779,7 @@ def render_policy_detail(idata: dict, expanded: bool = True):
         )
 
     with st.expander("📌 調査方針", expanded=expanded):
-        st.write(idata.get("search_plan", ""))
+        st.write(to_ja_field_names(idata.get("search_plan", "")))
         st.caption("検索キーワード（e-Gov法令API）: " + " / ".join(idata.get("search_keywords", [])))
         st.caption("🌐 AIWeb検索（自動実施） ● 横浜市・神奈川県の条例・規制（公式サイト） ● 省庁ガイドライン・FAQ（厚生労働省・消防庁・環境省・国土交通省・経済産業省）")
 
@@ -585,6 +833,26 @@ def render_results_detail(idata: dict):
     c1.metric("🔴 必須対応", rc.get("required", 0), help="稼働前に必ず届出・対応が必要な法令数")
     c2.metric("🟡 要確認",   rc.get("check", 0),    help="仕様確定後に判断が必要な法令数")
 
+    # 網羅性検証で対応情報が見つからなかった論点（確認漏れリスクとして明示）
+    uncovered = idata.get("uncovered_issues") or []
+    if uncovered:
+        items_html = "".join(
+            f'<li style="margin-bottom:6px;line-height:1.6;">{html_lib.escape(to_ja_field_names(u))}</li>'
+            for u in uncovered
+        )
+        st.markdown(
+            f'<div style="border:1px solid #EF9A9A;border-left:6px solid #C62828;'
+            f'border-radius:8px;background:#FFEBEE;padding:14px 18px;margin:10px 0;">'
+            f'<div style="color:#B71C1C;font-weight:700;font-size:15px;margin-bottom:6px;">'
+            f'🚨 対応法令を確認できなかった論点</div>'
+            f'<div style="color:#7F1D1D;font-size:13px;margin-bottom:10px;">'
+            f'AI調査（e-Gov・Web検索）では下記の論点に対応する法令・情報を確認できませんでした。'
+            f'確認漏れ・届出漏れを防ぐため、担当部署・所轄機関への直接確認を推奨します。</div>'
+            f'<ul style="margin:0;padding-left:20px;color:#4E342E;font-size:14px;">{items_html}</ul>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
     st.divider()
     law_items = idata.get("law_items", [])
 
@@ -606,18 +874,31 @@ def render_results_detail(idata: dict):
         if _t and _rid and _t not in _law_rev_id_map:
             _law_rev_id_map[_t] = _rid
 
+    # 条番号単位で取得済みを管理し、再調査で条番号が増えた場合も差分だけ取得する
     _pending_fetches = []
     for _law in law_items:
         _lid = _law.get("law_id", "") or _law_id_map.get(_law.get("law_name", ""), "")
         _rid = _law.get("law_revision_id", "") or _law_rev_id_map.get(_law.get("law_name", ""), "")
         _arts = [a for a in _law.get("relevant_articles", []) if a and a.strip()]
         _cache_k = f"article_text_{_lid}"
-        if _lid and _arts and _cache_k not in st.session_state:
-            _pending_fetches.append((_lid, _rid, _arts, _cache_k))
+        _fetched_k = f"article_fetched_{_lid}"
+        _fetched: set = st.session_state.get(_fetched_k, set())
+        _missing = [a for a in _arts if a not in _fetched]
+        if _lid and _missing:
+            _pending_fetches.append((_lid, _rid, _missing, _cache_k, _fetched_k))
     if _pending_fetches:
         with st.spinner(f"条文を取得中...（{len(_pending_fetches)}件）"):
-            for _lid, _rid, _arts, _ck in _pending_fetches:
-                st.session_state[_ck] = fetch_article_text(_lid, _arts, _rid)
+            for _lid, _rid, _arts, _ck, _fk in _pending_fetches:
+                got = fetch_article_text(_lid, _arts, _rid)
+                merged = dict(st.session_state.get(_ck, {}))
+                merged.update(got)
+                st.session_state[_ck] = merged
+                st.session_state[_fk] = set(st.session_state.get(_fk, set())) | set(_arts)
+                # 条見出し（例：（建築確認））も取得してキャッシュ（XMLは取得済みなので即時）
+                caps = fetch_article_captions(_lid, _arts, _rid)
+                merged_caps = dict(st.session_state.get(f"article_caption_{_lid}", {}))
+                merged_caps.update(caps)
+                st.session_state[f"article_caption_{_lid}"] = merged_caps
 
     for i, law in enumerate(law_items):
         p = law.get("priority", "check")
@@ -637,23 +918,64 @@ def render_results_detail(idata: dict):
             # 適用理由
             st.markdown(
                 f'<div style="font-size:13px;color:#444;padding:6px 0 10px;">'
-                f'📌 <em>{law.get("applicability", "")}</em></div>',
+                f'📌 <em>{html_lib.escape(law.get("applicability", ""))}</em></div>',
                 unsafe_allow_html=True,
             )
 
             # 条番号 + 届出施設 サマリーカード
             cache_key = f"article_text_{law_id}"
             cached_texts: dict = st.session_state.get(cache_key, {}) if law_id else {}
+            caption_map: dict = st.session_state.get(f"article_caption_{law_id}", {}) if law_id else {}
+
+            # 条番号→章タイトルのマップ（法令単位で一度だけ取得。XMLはキャッシュ済みのため通常は即時）
+            chapter_cache_key = f"article_chapter_{law_id}"
+            if law_id and relevant_articles and chapter_cache_key not in st.session_state:
+                try:
+                    st.session_state[chapter_cache_key] = fetch_article_chapters(
+                        law_id,
+                        law.get("law_revision_id", "") or _law_rev_id_map.get(law_name, ""),
+                    )
+                except Exception:
+                    st.session_state[chapter_cache_key] = {}
+            chapter_map: dict = st.session_state.get(chapter_cache_key, {}) if law_id else {}
+
+            def _with_caption(a: str) -> str:
+                # 見出しは e-Gov 取得分（本物）のみ表示する。
+                # 旧データに残る LLM 由来の（）付き見出しは信頼できないため取り除く
+                base = re.sub(r"（[^）]*）", "", a).strip()
+                return base + caption_map.get(base, caption_map.get(a, ""))
 
             def _art_link(a: str) -> str:
+                a = html_lib.escape(_with_caption(a))
                 if law_id:
                     return (f'<a href="https://laws.e-gov.go.jp/law/{law_id}" target="_blank" '
                             f'style="color:#1565C0;text-decoration:underline;">{a}</a>')
                 return f'<span style="color:#1565C0;">{a}</span>'
 
-            art_str = "　".join(_art_link(a) for a in relevant_articles) \
-                if relevant_articles else '<span style="color:#888;">条番号確認中</span>'
-            auth_str = "　/　".join(authorities) if authorities else '<span style="color:#888;">―</span>'
+            def _chapter_of(a: str) -> str:
+                # "第28条の2第1項（見出し）" → "第28条の2" に正規化して章を引く
+                m = re.match(r"第\d+条(?:の\d+)*", re.sub(r"（[^）]*）", "", a).strip())
+                return chapter_map.get(m.group(0), "") if m else ""
+
+            if not relevant_articles:
+                art_str = '<span style="color:#888;">条番号確認中</span>'
+            elif any(_chapter_of(a) for a in relevant_articles):
+                # 条番号の昇順に並べてから章ごとにグルーピング表示
+                # （条番号は章立て順に振られているため、章も昇順に並ぶ）
+                _groups: dict = {}
+                for a in sorted(relevant_articles, key=article_sort_key):
+                    _groups.setdefault(_chapter_of(a), []).append(a)
+                art_str = "".join(
+                    '<div style="margin:2px 0;">'
+                    + (f'<div style="font-size:12px;color:#555;font-weight:700;">【{html_lib.escape(ch)}】</div>' if ch else "")
+                    + '<div style="padding-left:1em;">' + "　".join(_art_link(a) for a in arts) + "</div>"
+                    + "</div>"
+                    for ch, arts in _groups.items()
+                )
+            else:
+                art_str = "　".join(_art_link(a) for a in relevant_articles)
+            auth_str = "　/　".join(html_lib.escape(a) for a in authorities) \
+                if authorities else '<span style="color:#888;">―</span>'
 
             st.markdown(
                 f'<div style="border:1px solid #E0E0E0;border-radius:6px;overflow:hidden;margin-bottom:10px;">'
@@ -678,14 +1000,32 @@ def render_results_detail(idata: dict):
                 f'<a href="{egov_link_url}" target="_blank" '
                 f'style="font-size:12px;color:#1565C0;">🔗 e-Gov で条文を確認</a>'
             )
-            if cached_texts:
-                art_rows = "".join(
-                    f'<div style="margin-bottom:10px;">'
-                    f'<div style="font-size:12px;font-weight:700;color:#1565C0;margin-bottom:3px;">{ref}</div>'
-                    f'<div style="font-size:12px;color:#333;line-height:1.75;white-space:pre-wrap;">{text}</div>'
-                    f'</div>'
-                    for ref, text in cached_texts.items()
-                )
+            # キャッシュには過去の調査ラウンドの条文も残るため、
+            # 現在の relevant_articles に含まれる条番号だけを表示する
+            art_pairs = [
+                (a, cached_texts[a])
+                for a in sorted(relevant_articles, key=article_sort_key)
+                if a in cached_texts
+            ]
+            if art_pairs:
+                # 条番号カードと同様に、章が変わる位置に章見出しを挿入する
+                _rows: list = []
+                _last_ch = None
+                for ref, text in art_pairs:
+                    _ch = _chapter_of(ref)
+                    if _ch and _ch != _last_ch:
+                        _rows.append(
+                            f'<div style="font-size:12px;color:#555;font-weight:700;'
+                            f'margin:6px 0 4px;">【{html_lib.escape(_ch)}】</div>'
+                        )
+                    _last_ch = _ch
+                    _rows.append(
+                        f'<div style="margin-bottom:10px;">'
+                        f'<div style="font-size:12px;font-weight:700;color:#1565C0;margin-bottom:3px;">{html_lib.escape(_with_caption(ref))}</div>'
+                        f'<div style="font-size:12px;color:#333;line-height:1.75;white-space:pre-wrap;">{html_lib.escape(text)}</div>'
+                        f'</div>'
+                    )
+                art_rows = "".join(_rows)
                 st.markdown(
                     f'<div style="background:#F8F9FA;border-left:3px solid #1565C0;'
                     f'border-radius:0 4px 4px 0;padding:10px 14px;margin-bottom:10px;">'
@@ -708,7 +1048,7 @@ def render_results_detail(idata: dict):
                     if not article_ref and relevant_articles:
                         article_ref = "・".join(relevant_articles)
                     article_html = (
-                        f'<span style="color:#283593;">📖 {law_name}&nbsp;{article_ref}</span>'
+                        f'<span style="color:#283593;">📖 {html_lib.escape(law_name)}&nbsp;{html_lib.escape(article_ref)}</span>'
                         if article_ref else
                         f'<span style="color:#888;">📖 条文番号確認中</span>'
                     )
@@ -716,11 +1056,11 @@ def render_results_detail(idata: dict):
                     st.markdown(
                         f'<div style="background:{d_bg};border-left:4px solid {d_border};'
                         f'padding:9px 13px;border-radius:4px;margin:4px 0;">'
-                        f'<div style="font-weight:600;font-size:14px;">{d_icon} {d.get("item", "")}</div>'
+                        f'<div style="font-weight:600;font-size:14px;">{d_icon} {html_lib.escape(d.get("item", ""))}</div>'
                         f'<div style="margin-top:5px;font-size:12px;color:#555;display:flex;flex-wrap:wrap;gap:12px;">'
                         f'{article_html}'
-                        f'<span style="color:#1B5E20;font-weight:600;">🏛️ {authority_val}</span>'
-                        f'<span>⏰ {d.get("deadline", "")}</span>'
+                        f'<span style="color:#1B5E20;font-weight:600;">🏛️ {html_lib.escape(authority_val)}</span>'
+                        f'<span>⏰ {html_lib.escape(d.get("deadline", ""))}</span>'
                         f'</div>'
                         f'</div>',
                         unsafe_allow_html=True,
@@ -738,11 +1078,29 @@ def render_results_detail(idata: dict):
                     st.markdown(
                         f'<div style="background:#F3F4F6;border-left:4px solid #6B7280;'
                         f'padding:8px 12px;border-radius:4px;margin:4px 0;">'
-                        f'● <strong>{act.get("item", "")}</strong><br>'
-                        f'<span style="font-size:12px;color:#555;">⏰ 期限：{act.get("deadline", "")}</span>'
+                        f'● <strong>{html_lib.escape(act.get("item", ""))}</strong><br>'
+                        f'<span style="font-size:12px;color:#555;">⏰ 期限：{html_lib.escape(act.get("deadline", ""))}</span>'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
+
+    # 確認したうえで非該当と判断した法令（判断理由をレビュー可能にし、暗黙の見落としを防ぐ）
+    excluded = idata.get("excluded_laws") or []
+    if excluded:
+        with st.expander(
+            f"🚫 確認のうえ非該当と判断した法令（{len(excluded)}件）― 判断理由に誤りがないかご確認ください",
+            expanded=False,
+        ):
+            for e in excluded:
+                st.markdown(
+                    f'<div style="background:#FAFAFA;border-left:3px solid #9E9E9E;'
+                    f'padding:8px 12px;border-radius:4px;margin:4px 0;font-size:13px;">'
+                    f'<strong>{html_lib.escape(e.get("law_name", ""))}</strong><br>'
+                    f'<span style="color:#555;">{html_lib.escape(to_ja_field_names(e.get("reason", "")))}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            st.caption("※ 前提となる設備情報が変わった場合は再調査してください。")
 
 
 def render_results_review(idata: dict):
@@ -855,8 +1213,9 @@ def render_sidebar():
         st.progress((phase_idx + 1) / len(PHASES))
         st.caption(f"ステップ {phase_idx + 1} / {len(PHASES)}")
 
+        all_done = st.session_state.ui_phase == "complete"
         for i, phase in enumerate(PHASES):
-            if i < phase_idx:
+            if i < phase_idx or all_done:
                 st.write(f"✅ {phase}")
             elif i == phase_idx:
                 st.write(f"▶️ **{phase}**")
@@ -887,41 +1246,122 @@ def render_sidebar():
                 else:
                     badge = "📌"
                 st.markdown(
-                    f'<div class="sidebar-card">{badge} {icon} <b>{label}</b><br>{val}</div>',
+                    f'<div class="sidebar-card">{badge} {icon} <b>{label}</b><br>{html_lib.escape(str(val))}</div>',
                     unsafe_allow_html=True,
                 )
 
         st.divider()
-        st.caption(f"案件ID: {st.session_state.thread_id[:8]}...")
+
+        # 社内文書の登録・管理（Agentic RAG 検索の対象）
+        with st.expander("📁 社内文書（Agentic RAG検索）"):
+            flash = st.session_state.pop("ingest_result", None)
+            if flash:
+                if flash.get("added"):
+                    st.success("登録完了: " + "、".join(flash["added"]))
+                if flash.get("skipped"):
+                    st.info("登録済みのためスキップ: " + "、".join(flash["skipped"]))
+                if flash.get("failed"):
+                    st.warning("テキスト抽出不可: " + "、".join(flash["failed"]))
+                if flash.get("error"):
+                    st.error(f"登録に失敗しました: {flash['error']}")
+
+            registered = list_internal_docs()
+            if registered:
+                st.caption(
+                    f"登録済み {len(registered)} ファイル（調査時にAIが検索します）。"
+                    "各ファイル右の 🗑️ で個別に削除できます。"
+                )
+                for r in registered:
+                    c1, c2 = st.columns([5, 1])
+                    c1.markdown(
+                        f'<div style="font-size:12px;padding-top:6px;">📄 {html_lib.escape(r["name"])}'
+                        f'<span style="color:#888;">（{r["chunks"]}チャンク）</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                    if c2.button("🗑️", key=f"del_doc_{r['name']}", help="この文書をインデックスから削除"):
+                        delete_internal_doc(r["name"])
+                        st.rerun()
+
+                # 全削除（誤操作防止のため確認ステップを挟む）
+                if st.session_state.get("confirm_delete_all_docs"):
+                    st.warning(f"登録済み {len(registered)} ファイルをすべて削除します。よろしいですか？")
+                    dc1, dc2 = st.columns(2)
+                    if dc1.button("削除する", type="primary", key="do_delete_all_docs",
+                                  use_container_width=True):
+                        delete_all_internal_docs()
+                        st.session_state.confirm_delete_all_docs = False
+                        st.rerun()
+                    if dc2.button("キャンセル", key="cancel_delete_all_docs",
+                                  use_container_width=True):
+                        st.session_state.confirm_delete_all_docs = False
+                        st.rerun()
+                elif st.button("🗑️ すべて削除", key="delete_all_docs_btn", use_container_width=True):
+                    st.session_state.confirm_delete_all_docs = True
+                    st.rerun()
+            else:
+                st.caption(
+                    "未登録です。社内規定・基準・過去の届出事例などを登録すると、"
+                    "調査時にAIが社内文書も検索します。"
+                )
+
+            up_files = st.file_uploader(
+                "社内文書を追加",
+                type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
+                accept_multiple_files=True,
+                key="internal_docs_uploader",
+            )
+            if up_files and st.button("📥 登録（ベクトル化）", use_container_width=True):
+                with st.spinner("社内文書を登録中...（埋め込みを生成しています）"):
+                    try:
+                        st.session_state.ingest_result = ingest_internal_docs(
+                            [(f.name, f.getvalue()) for f in up_files]
+                        )
+                    except Exception as e:
+                        logger.error("社内文書の登録でエラー:\n%s", traceback.format_exc())
+                        st.session_state.ingest_result = {"error": str(e)}
+                st.rerun()
+
+        # ケースメモリ（承認済み過去案件・CBR）の管理
+        with st.expander("🧠 ケースメモリ（過去案件）"):
+            saved_cases = list_cases()
+            if saved_cases:
+                st.caption(
+                    f"承認済み案件 {len(saved_cases)}件。"
+                    "新しい案件の分析時に、類似案件が自動で参照されます。"
+                )
+                for c in saved_cases:
+                    cc1, cc2 = st.columns([5, 1])
+                    cc1.markdown(
+                        f'<div style="font-size:12px;padding-top:6px;">📋 {html_lib.escape(c["case_id"])}'
+                        f'<br><span style="color:#888;">{html_lib.escape(c["equipment_type"] or "（設備種別不明）")}'
+                        f'・法令{c["law_count"]}件・{c["saved_at"]}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                    if cc2.button("🗑️", key=f"del_case_{c['case_id']}", help="この事例をケースメモリから削除"):
+                        delete_case(c["case_id"])
+                        st.rerun()
+            else:
+                st.caption(
+                    "まだ事例がありません。レポートを承認すると、その案件が自動で保存され、"
+                    "次回以降の類似案件の分析で参照されます（使うほど賢くなります）。"
+                )
+
+        st.divider()
+        # 案件IDはレポートと同じ case_id を表示する（確定前は thread_id で代用）
+        case_id = get_state_value(st.session_state.thread_id, "case_id")
+        if case_id:
+            st.caption(f"案件ID: {case_id}")
+        else:
+            st.caption(f"案件ID: {st.session_state.thread_id[:8]}...")
         st.caption("⚠️ 本ツールの提案は参考情報です。最終判断は担当者が行ってください。")
-
-
-# ─────────────────────────────────────────
-# レポートプレビュー（インライン）
-# ─────────────────────────────────────────
-def render_report_modal():
-    if not st.session_state.get("show_report"):
-        return
-    html = st.session_state.get("report_html", "")
-    if not html:
-        return
-
-    with st.expander("📄 Webレポート（プレビュー）", expanded=True):
-        st.iframe(html, height=620, scrolling=True)
-        if st.button("閉じる"):
-            st.session_state.show_report = False
-            st.rerun()
 
 
 # ─────────────────────────────────────────
 # 自動スクロール（最下部へ）
 # ─────────────────────────────────────────
 def _embed_html(html_str: str, height: int = 1):
-    """HTML（JavaScript含む）を iframe として埋め込む。
-    新しい Streamlit では st.iframe、古い版では components.html を使う。
-    height は st.iframe が 0 を拒否するため 1 以上にする。"""
-    render = getattr(st, "iframe", None) or components.html
-    render(html_str, height=max(1, height))
+    """HTML（JavaScript含む）を iframe として埋め込む。height は 1 以上にする。"""
+    components.html(html_str, height=max(1, height))
 
 
 def auto_scroll(duration_ms: int = 1200):
@@ -993,16 +1433,16 @@ def main():
         "　|　対象：横浜市内の会社施設"
     )
 
-    render_report_modal()
     st.divider()
 
-    if not st.session_state.display_messages:
+    if not st.session_state.display_messages and st.session_state.ui_phase == "start":
         st.markdown("""
 <div style="background:#E8F5E9;border-left:4px solid #43A047;padding:14px 18px;border-radius:4px;margin-bottom:16px">
 👋 <b>ようこそ！</b> 法令確認・届出施設確認AIです。<br>
 設備情報をヒアリングし、横浜市内の会社施設で設備を導入する際に必要な法令・届出施設をAIが調査・報告します。<br>
-まず「開始する」を押すと、AIが設備情報のヒアリングを開始します。<br><br>
-<b>進め方：</b> 1. ヒアリング → 2. 情報整理 → 3. 調査方針確認 → 4. 調査実施 → 5. 調査結果確認 → 6. レポート作成 → 7. 完了確認
+仕様書などの関連資料をアップロードすると、AIが設備情報を自動で読み取り、ヒアリングでの手入力を減らせます。<br>
+まず「開始する」を押すと、AIが設備情報のヒアリング（資料がある場合は抽出結果の確認）を開始します。<br><br>
+<b>進め方：</b> 1. ヒアリング → 2. 情報整理・分析 → 3. 調査方針確認 → 4. 調査実施 → 5. 調査結果確認 → 6. レポート作成 → 7. 完了確認
 </div>
 """, unsafe_allow_html=True)
     else:
