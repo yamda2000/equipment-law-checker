@@ -33,6 +33,11 @@ class AppState(TypedDict):
     # 網羅性検証で「対応情報が見つからない」と判定された論点（担当者に明示）
     uncovered_issues: list
 
+    # 統合前にe-Govから取得した条文抜粋のキャッシュ
+    # {"law_ids": [...], "excerpts": str}。再調査後の再統合で法令候補が
+    # 変わっていなければ再利用し、条文選択LLM呼び出し（最大8回）を省く
+    prefetch_cache: dict
+
     # 法令別アクションアイテム
     law_items: list  # LawItem の dict リスト
     synthesis_summary: str

@@ -6,11 +6,57 @@ GEMINI_API_KEY が未設定の場合はスタブデータを返す。
 """
 
 import os
+import re
+import html
 import time
+import urllib.parse
+
+import requests
 
 
 _MAX_RETRIES = 3
 _RETRY_BASE_WAIT = 5  # 秒（5 → 10 → 20 と増加）
+
+# ページ本文取得を許可する公式ドメイン（自治体・省庁・e-Gov）
+_OFFICIAL_HOST_SUFFIXES = (".go.jp", ".lg.jp")
+
+# Gemini Web検索の累積使用量（プロセス単位）。
+# アプリ側（app.py）がセッション開始時点との差分を読み取ってコスト表示に使う。
+_GEMINI_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+
+
+def get_gemini_usage() -> dict:
+    """Gemini Web検索の累積使用量スナップショットを返す。"""
+    return dict(_GEMINI_USAGE)
+
+
+def fetch_page_text(url: str, max_chars: int = 1200) -> str:
+    """公式サイト（.go.jp / .lg.jp）のページ本文を取得してテキスト化する。
+
+    Web検索（Gemini Grounding）の結果はタイトルとURLしか持たないことが多く、
+    条例・届出手続きの適用判断材料が薄いため、本文を取得して snippet を補完する。
+    Grounding のリダイレクトURLにも対応する（リダイレクト後の最終URLのドメインで判定）。
+    対象外ドメイン・取得失敗時は空文字を返す。
+    """
+    try:
+        resp = requests.get(
+            url, timeout=10, allow_redirects=True,
+            headers={"User-Agent": "LawCheckAI/1.0 (research; contact: legal-ai-dev)"},
+        )
+        host = urllib.parse.urlparse(resp.url).hostname or ""
+        if not host.endswith(_OFFICIAL_HOST_SUFFIXES):
+            return ""
+        resp.raise_for_status()
+        # 文字コード判定（ヘッダーに charset が無い日本語サイト対策）
+        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding
+        raw = resp.text
+        raw = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
+        raw = re.sub(r"(?s)<[^>]+>", " ", raw)
+        text = re.sub(r"\s+", " ", html.unescape(raw)).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
 
 
 def search_web(query: str, context: str = "") -> list[dict]:
@@ -45,6 +91,13 @@ def _search_with_gemini(query: str, api_key: str) -> list[dict]:
                     response_modalities=["TEXT"],
                 ),
             )
+
+            # 使用量を積算（コスト表示用）
+            _GEMINI_USAGE["requests"] += 1
+            usage = getattr(response, "usage_metadata", None)
+            if usage is not None:
+                _GEMINI_USAGE["prompt_tokens"]     += getattr(usage, "prompt_token_count", 0) or 0
+                _GEMINI_USAGE["completion_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
 
             results = []
             seen_urls: set[str] = set()

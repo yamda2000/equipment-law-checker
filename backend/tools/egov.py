@@ -169,7 +169,7 @@ EQUIPMENT_KEYWORD_MAP = {
     "fire_exhaust": [
         "消防法",
         "大気汚染防止法",
-        "粉じん障害予防規則",
+        "粉じん障害防止規則",
     ],
     "wastewater": [
         "水質汚濁防止法",
@@ -200,7 +200,7 @@ _VALUE_KEYWORD_TRIGGERS: list[tuple] = [
     (re.compile(r"クレーン|ホイスト|巻上げ"),
      ["クレーン等安全規則"]),
     (re.compile(r"粉じん|研磨|グラインダ|切削粉|サンドブラスト"),
-     ["粉じん障害予防規則"]),
+     ["粉じん障害防止規則"]),
     (re.compile(r"燃料|灯油|軽油|ガソリン|重油|LPG|都市ガス"),
      ["消防法", "危険物の規制に関する政令"]),
 ]
@@ -331,12 +331,13 @@ def fetch_article_captions(law_id: str, article_refs: list[str],
 
     results: dict[str, str] = {}
     for ref in article_refs:
-        art_match = re.search(r'第(\d+)条(?:の(\d+))?', ref)
+        # 「第28条の2の3」のような多段の枝番も含めて Num 属性形式（28_2_3）に変換する
+        art_match = re.search(r'第(\d+)条((?:の\d+)*)', ref)
         if not art_match:
             continue
-        art_num = art_match.group(1)
-        if art_match.group(2):
-            art_num += f"_{art_match.group(2)}"
+        art_num = art_match.group(1) + "".join(
+            f"_{n}" for n in re.findall(r"の(\d+)", art_match.group(2))
+        )
         cap = caption_by_num.get(art_num)
         if cap:
             results[ref] = cap
@@ -459,15 +460,15 @@ def _extract_articles(xml_str: str, article_refs: list[str]) -> dict[str, str]:
     results: dict[str, str] = {}
 
     for ref in article_refs:
-        # "第10条" → "10"、"第11条の2" → "11_2"（XMLのNum属性形式）、
-        # "第10条第1項" → article="10", para="1"
-        art_match = re.search(r'第(\d+)条(?:の(\d+))?', ref)
+        # "第10条" → "10"、"第11条の2" → "11_2"、"第28条の2の3" → "28_2_3"
+        # （XMLのNum属性形式）。"第10条第1項" → article="10", para="1"
+        art_match = re.search(r'第(\d+)条((?:の\d+)*)', ref)
         para_match = re.search(r'第(\d+)項', ref)
         if not art_match:
             continue
-        art_num = art_match.group(1)
-        if art_match.group(2):
-            art_num += f"_{art_match.group(2)}"
+        art_num = art_match.group(1) + "".join(
+            f"_{n}" for n in re.findall(r"の(\d+)", art_match.group(2))
+        )
         para_num = para_match.group(1) if para_match else None
 
         text = _find_article_text(root, art_num, para_num)

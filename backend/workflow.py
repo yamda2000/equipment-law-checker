@@ -26,16 +26,17 @@ except Exception:  # 古いバージョン互換
 from backend.state import AppState
 from backend.prompts import (
     HEARING_SYSTEM, ANALYSIS_SYSTEM, SYNTHESIS_SYSTEM, SEARCH_AGENT_SYSTEM,
-    ARTICLE_SELECTION_SYSTEM, COVERAGE_CHECK_SYSTEM,
+    ARTICLE_SELECTION_SYSTEM, PRE_SYNTHESIS_ARTICLE_SYSTEM, COVERAGE_CHECK_SYSTEM,
 )
 from backend.tools.egov import (
-    search_laws_by_keyword, fetch_article_list, normalize_article_ref,
-    get_suggested_keywords,
+    search_laws_by_keyword, fetch_article_list, fetch_article_text,
+    normalize_article_ref, get_suggested_keywords,
 )
-from backend.tools.web_search import search_web
+from backend.tools.web_search import search_web, fetch_page_text
 from backend.tools.internal_docs import search_internal_docs, internal_docs_available
 from backend.rag_agent import agentic_internal_search
 from backend.case_memory import save_case, find_similar_cases, format_cases_for_prompt
+from backend.fields import FIELD_JA as HEARING_FIELD_JA
 from backend.report_gen import generate_html_report
 
 
@@ -73,7 +74,8 @@ class AnalysisResult(BaseModel):
     analysis_summary: str = Field(description="設備情報の分析サマリー")
 
 
-MAX_SEARCH_ITERATIONS = 20
+MAX_SEARCH_ITERATIONS = 30    # Agenticループの最大検索回数
+MAX_SEARCH_RESULTS    = 120   # 収集結果の保持・統合入力の上限（漏れ防止のため広めに取る）
 
 
 class SearchAction(BaseModel):
@@ -105,6 +107,21 @@ class CoverageCheck(BaseModel):
 class DeliveryItem(BaseModel):
     item: str = Field(description="届出・申請の名称")
     authority: str = Field(description="届出先・申請先機関")
+    authority_basis: str = Field(
+        default="",
+        description=(
+            "届出先の根拠（1〜2行）。法令上の届出先規定（例：騒音規制法第6条「市町村長に届け出」）と、"
+            "実際の窓口の出典（例：横浜市公式サイトの案内）を書く。"
+            "条文抜粋・Web検索結果に根拠がなく推定の場合は「一般的な所管に基づく推定（要確認）」と明記する"
+        ),
+    )
+    authority_source_id: str = Field(
+        default="",
+        description=(
+            "届出先の根拠に使った調査結果のID（調査結果一覧の [R◯] の◯部分を含む形式。例：\"R12\"）。"
+            "Webページ等を出典にした場合のみ記入し、条文のみが根拠・推定の場合は空文字"
+        ),
+    )
     deadline: str = Field(description="届出期限（例：設置前、稼働前）")
     priority: str = Field(description="required | check | pending")
     law_article: str = Field(default="", description="根拠条文（例：第10条第1項）。特定できる場合のみ")
@@ -228,19 +245,6 @@ COMPLETE_HEARING_TOOL = {
 
 
 # ─── ノード: ヒアリング ───────────────────────────────────────────
-HEARING_FIELD_JA = {
-    "equipment_type":     "設備の種類",
-    "installation_place": "設置場所",
-    "operation_purpose":  "用途・目的",
-    "scheduled_date":     "稼働開始予定日",
-    "chemicals":          "薬品・溶剤・ガス・燃料",
-    "fire_exhaust":       "火気・熱源・排気・粉じん",
-    "wastewater":         "排水・廃液・廃棄物",
-    "noise_vibration":    "騒音・振動",
-    "radiation":          "放射線・X線",
-    "construction":       "建屋改修・電気工事・配管工事",
-    "additional_info":    "その他の情報",
-}
 
 # 完了時に ToolMessage へ入れる文言。app.py 側がこのマーカーで
 # 「ヒアリング完了」表示を判定するため、変更時は app.py と揃えること
@@ -297,6 +301,10 @@ def hearing_node(state: AppState) -> dict:
             continue
 
         # 完了を受理（却下上限に達した場合は不完全でも先に進め、デッドロックを防ぐ）
+        # 未記入のまま残った項目は「不明（未確認）」に正規化し、
+        # 統合フェーズの「情報不足→要確認」ガードに乗せる
+        for k in unanswered:
+            info[k] = "不明（未確認）"
         new_messages.append(ToolMessage(
             content=HEARING_COMPLETE_MARKER,
             tool_call_id=tc.get("id", ""),
@@ -390,6 +398,26 @@ def policy_review_node(state: AppState) -> dict:
     }
 
 
+# ─── 進捗ライブ送信ヘルパー ───────────────────────────────────────
+def _make_emit():
+    """stream_mode="custom" への進捗送信関数を返す。invoke 実行時は no-op。"""
+    _writer = None
+    if get_stream_writer is not None:
+        try:
+            _writer = get_stream_writer()
+        except Exception:
+            _writer = None
+
+    def emit(entry: str) -> None:
+        if _writer is not None:
+            try:
+                _writer({"progress": entry})
+            except Exception:
+                pass
+
+    return emit
+
+
 # ─── Web検索結果の処理ヘルパー ────────────────────────────────────
 def _process_web_results(
     web_results: list[dict],
@@ -444,19 +472,7 @@ def search_node(state: AppState) -> dict:
     executed_queries: set[str] = set(state.get("executed_queries", []) or [])
 
     # 進捗のライブ送信（stream_mode="custom"）。invoke 実行時は no-op。
-    _writer = None
-    if get_stream_writer is not None:
-        try:
-            _writer = get_stream_writer()
-        except Exception:
-            _writer = None
-
-    def emit(entry: str) -> None:
-        if _writer is not None:
-            try:
-                _writer({"progress": entry})
-            except Exception:
-                pass
+    emit = _make_emit()
 
     emit("🔎 法令調査を開始します（e-Gov 法令API ＋ Web検索）...")
 
@@ -557,10 +573,16 @@ def search_node(state: AppState) -> dict:
         issues_str   = "\n".join(f"- {i}" for i in issues)
         keywords_str = "\n".join(f"- {k}" for k in initial_keywords)
         history_str  = "\n".join(search_log) if search_log else "（なし）"
+        # タイトルは全件見せて全体像を判断させ、概要は直近10件のみ付けて
+        # トークンを抑える（先頭N件だけだと自分の新規取得分が見えなくなる）
+        _recent_cutoff = max(0, len(results) - 10)
         results_str  = "\n".join(
             f"- {r.get('title','?')} ({r.get('source','?')})"
-            + (f"\n    概要: {r.get('snippet','')[:150]}" if r.get('snippet') else "")
-            for r in results[:30]
+            + (
+                f"\n    概要: {r.get('snippet','')[:150]}"
+                if r.get('snippet') and i >= _recent_cutoff else ""
+            )
+            for i, r in enumerate(results)
         ) if results else "（なし）"
 
         note_str = (
@@ -581,7 +603,7 @@ def search_node(state: AppState) -> dict:
             f"## 社内文書インデックス\n{internal_str}\n\n"
             f"## 検索履歴（{decision_count}回目判断）\n{history_str}\n\n"
             f"## ⚠️ 検索済みクエリ（再検索禁止。結果は取得済みで、再実行しても新規情報は得られない）\n{executed_str}\n\n"
-            f"## 取得済み法令・情報（{len(results)}件）\n{results_str}"
+            f"## 取得済み法令・情報（{len(results)}件・概要は直近10件のみ表示）\n{results_str}"
             f"{note_str}"
         )
 
@@ -611,13 +633,30 @@ def search_node(state: AppState) -> dict:
                 break
             continue
 
+        # 社内文書が未登録なのに internal が選ばれた場合は、検索枠を消費せずスキップ
+        if action.search_type == "internal" and not internal_docs_available():
+            consecutive_skips += 1
+            executed_queries.add(action.query)
+            skip_entry = f"⏭️ スキップ（社内文書が未登録のため社内検索は実行不可）:「{action.query}」"
+            search_log.append(skip_entry)
+            progress_messages.append(AIMessage(content=skip_entry, name="search_progress"))
+            emit(skip_entry)
+            if consecutive_skips >= 3:
+                done_entry = "✅ 調査完了（新規クエリの提案がなくなったため終了します）"
+                progress_messages.append(AIMessage(content=done_entry, name="search_progress"))
+                emit(done_entry)
+                break
+            continue
+
         consecutive_skips = 0
         executed_queries.add(action.query)
         executed_searches += 1
 
         if action.search_type == "egov":
             emit(f"📚 e-Gov 法令API で追加検索中:「{action.query}」")
-            laws = search_laws_by_keyword(action.query, max_results=5)
+            # 1クエリの取得は3件（本法＋施行令＋施行規則で通常足りる。
+            # 5件だと周辺法令のノイズが増えて上限を圧迫するため）
+            laws = search_laws_by_keyword(action.query, max_results=3)
             search_count += 1
             added = 0
             for law in laws:
@@ -633,7 +672,7 @@ def search_node(state: AppState) -> dict:
         elif action.search_type == "internal":
             # 下位の Agentic RAG サブエージェントに委譲する
             # （クエリ展開→ベクトル検索→関連性評価→不足時の再検索を自律実行）
-            emit(f"📁 社内文書を Agentic RAG で調査中:「{action.query}」")
+            emit(f"📁 AIエージェントが社内文書を調査中:「{action.query}」")
 
             def _rag_progress(msg: str) -> None:
                 search_log.append(msg)
@@ -646,7 +685,7 @@ def search_node(state: AppState) -> dict:
                 on_progress=_rag_progress,
             )
             search_count += 1
-            entry, added = _process_web_results(internal_hits, action.query, seen_titles, results, "社内文書RAG", icon="📁")
+            entry, added = _process_web_results(internal_hits, action.query, seen_titles, results, "社内文書", icon="📁")
             entry = entry.replace("取得", "新規取得")
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
@@ -657,6 +696,29 @@ def search_node(state: AppState) -> dict:
             search_count += 1
             entry, added = _process_web_results(web_results, action.query, seen_titles, results, "AIWeb検索")
             entry = entry.replace("取得", "新規取得")
+            search_log.append(entry)
+            progress_messages.append(AIMessage(content=entry, name="search_progress"))
+            emit(entry)
+
+    # ── 公式ページ本文の補完 ──
+    # Web検索（Gemini Grounding）の結果はタイトルとURLのみで snippet が空のことが
+    # 多く、横浜市・神奈川県条例などの適用判断材料が薄い。公式ドメイン
+    # （.go.jp / .lg.jp）のページ本文を取得して snippet を補完する。
+    enrich_targets = [
+        r for r in results
+        if r.get("url") and r.get("source") == "Gemini Grounding"
+        and len(r.get("snippet", "")) < 50
+    ][:6]
+    if enrich_targets:
+        emit("📄 公式ページ（横浜市・神奈川県・省庁）の本文を取得して補完中...")
+        enriched = 0
+        for r in enrich_targets:
+            page_text = fetch_page_text(r["url"])
+            if page_text:
+                r["snippet"] = page_text
+                enriched += 1
+        if enriched:
+            entry = f"📄 公式ページ本文を{enriched}件取得（条例・手続きの判断材料に使用）"
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
             emit(entry)
@@ -689,11 +751,9 @@ def search_node(state: AppState) -> dict:
 
         uncovered = _run_coverage_check()
         if uncovered:
-            if len(uncovered) > 5:
-                emit(f"⚠️ 未カバー論点 {len(uncovered)}件のうち先頭5件を補完検索します")
-            else:
-                emit(f"⚠️ 未カバーの論点が{len(uncovered)}件。補完検索を実施します...")
-            for u in uncovered[:5]:
+            emit(f"⚠️ 未カバーの論点が{len(uncovered)}件。全件を補完検索します...")
+            _fill_start = len(results)
+            for u in uncovered:
                 q = (u.suggested_query or "").strip()
                 if not q or q in executed_queries:
                     continue
@@ -711,7 +771,7 @@ def search_node(state: AppState) -> dict:
                             added += 1
                     entry = f"🔍 [網羅性補完] 「{q}」→ {added}件取得"
                 elif u.search_type == "internal":
-                    emit(f"📁 [網羅性補完] 社内文書を Agentic RAG で調査:「{q}」")
+                    emit(f"📁 [網羅性補完] AIエージェントが社内文書を調査:「{q}」")
                     internal_hits = agentic_internal_search(
                         q,
                         context_hint=json.dumps(equipment_info, ensure_ascii=False),
@@ -725,6 +785,12 @@ def search_node(state: AppState) -> dict:
                 search_log.append(entry)
                 progress_messages.append(AIMessage(content=entry, name="search_progress"))
                 emit(entry)
+
+            # 補完検索で取得した結果は、上限超過時の割愛対象から保護する
+            # （網羅性チェックを通すために取得した根拠が、統合前に割愛で
+            # 消えて「チェックOKなのに根拠なし」になる矛盾を防ぐ）
+            for r in results[_fill_start:]:
+                r["protected"] = True
 
             # 補完後に再チェックし、それでも未カバーの論点を記録する
             uncovered_issues = [u.issue for u in _run_coverage_check()]
@@ -740,6 +806,53 @@ def search_node(state: AppState) -> dict:
         else:
             emit("✅ 全論点に対応する情報が収集されています")
 
+    # ── 上限超過時の切り捨て ──
+    # ソース別のバランスを保って割愛する。Web結果は条例・届出先・手続き情報の
+    # 主要ソースのため最低保持枠を確保し、e-Gov は必須法令・分析キーワード由来を
+    # 優先して残す（e-Gov だけで上限を埋めて Web が全滅すると、統合LLMが
+    # 届出先を判断できなくなる）。社内文書は全件保持する。
+    WEB_MIN_KEEP = 15
+    if len(results) > MAX_SEARCH_RESULTS:
+        # 網羅性補完で取得した結果（protected）は無条件に保持し、
+        # 残りの枠にソース別クォータを適用する
+        protected_res = [r for r in results if r.get("protected")]
+        rest          = [r for r in results if not r.get("protected")]
+        budget = max(0, MAX_SEARCH_RESULTS - len(protected_res))
+
+        def _src(r: dict) -> str:
+            s = r.get("source", "")
+            if s == "社内文書":
+                return "internal"
+            return "egov" if s.startswith("e-Gov") else "web"
+        internal_res = [r for r in rest if _src(r) == "internal"]
+        egov_res     = [r for r in rest if _src(r) == "egov"]
+        web_res      = [r for r in rest if _src(r) == "web"]
+
+        web_quota = min(
+            len(web_res),
+            max(WEB_MIN_KEEP, budget - len(internal_res) - len(egov_res)),
+        )
+        egov_quota = max(0, budget - len(internal_res) - web_quota)
+
+        dropped_egov = max(0, len(egov_res) - egov_quota)
+        dropped_web  = max(0, len(web_res) - web_quota)
+        if dropped_egov:
+            # ルールベース必須法令・AI分析キーワード由来の法令を優先して残す
+            prio = set(initial_keywords) | set(get_suggested_keywords(equipment_info))
+            egov_res = sorted(
+                egov_res, key=lambda r: 0 if r.get("keyword", "") in prio else 1
+            )[:egov_quota]
+        results = (
+            protected_res + internal_res + egov_res + web_res[:web_quota]
+        )[:MAX_SEARCH_RESULTS]
+        warn = (
+            f"⚠️ 収集件数が上限{MAX_SEARCH_RESULTS}件を超えたため、"
+            f"e-Gov {dropped_egov}件・Web {dropped_web}件を割愛しました"
+            f"（必須法令・社内文書・網羅性補完の取得分・Web最低{WEB_MIN_KEEP}件枠を優先保持）"
+        )
+        progress_messages.append(AIMessage(content=warn, name="search_progress"))
+        emit(warn)
+
     egov_count     = len([r for r in results if "e-Gov" in r.get("source", "")])
     internal_count = len([r for r in results if r.get("source", "") == "社内文書"])
     web_count      = len(results) - egov_count - internal_count
@@ -754,7 +867,7 @@ def search_node(state: AppState) -> dict:
     emit("🧩 調査結果を統合し、法令別の対応事項を整理中...")
 
     return {
-        "search_results":   results[:40],
+        "search_results":   results[:MAX_SEARCH_RESULTS],
         "executed_queries": sorted(executed_queries),
         "uncovered_issues": uncovered_issues,
         "phase":            "synthesizing",
@@ -771,19 +884,7 @@ def _ground_relevant_articles(law_items: list) -> None:
     一覧に実在しない条番号はすべて除去する。
     e-Govで原文を取得できない法令（条例等）は根拠を検証できないため条番号を表示しない。
     """
-    _writer = None
-    if get_stream_writer is not None:
-        try:
-            _writer = get_stream_writer()
-        except Exception:
-            _writer = None
-
-    def emit(entry: str) -> None:
-        if _writer is not None:
-            try:
-                _writer({"progress": entry})
-            except Exception:
-                pass
+    emit = _make_emit()
 
     selector_llm = _llm(max_tokens=2000).with_structured_output(ArticleSelection)
 
@@ -831,6 +932,112 @@ def _ground_relevant_articles(law_items: list) -> None:
             d["law_article"] = ref if base and base in valid_refs else ""
 
 
+# ─── 統合前の条文プリフェッチ ─────────────────────────────────────
+MAX_PREFETCH_LAWS = 8
+MAX_PREFETCH_ARTICLES = 3
+
+
+def _prefetch_article_excerpts(
+    equipment_info: dict, issues: list, search_results: list,
+    priority_keywords: set, emit,
+) -> str:
+    """統合前に主要候補法令の関連条文を e-Gov 原文から取得する。
+
+    e-Gov 検索結果は法令名しか持たないため、そのままでは適用判断が LLM の
+    内部知識頼みになる。ここで候補法令ごとに「適用範囲・届出義務・数量閾値」
+    に関わる条文を取得し、統合 LLM の判断根拠（特に数量閾値の照合）に使わせる。
+    """
+    egov_laws = [
+        r for r in search_results
+        if r.get("source", "").startswith("e-Gov") and r.get("law_id")
+    ]
+    if not egov_laws:
+        return ""
+
+    # ルールベース必須法令・分析キーワードでヒットした法令を優先する
+    prioritized = sorted(
+        egov_laws,
+        key=lambda r: 0 if r.get("keyword", "") in priority_keywords else 1,
+    )
+    candidates: list[dict] = []
+    seen_ids: set[str] = set()
+    for r in prioritized:
+        if r["law_id"] in seen_ids:
+            continue
+        seen_ids.add(r["law_id"])
+        candidates.append(r)
+        if len(candidates) >= MAX_PREFETCH_LAWS:
+            break
+
+    selector_llm = _llm(max_tokens=1000).with_structured_output(ArticleSelection)
+    info_str = json.dumps(equipment_info, ensure_ascii=False, indent=2)
+    issues_str = "\n".join(f"- {i}" for i in issues)
+
+    blocks: list[str] = []
+    for law in candidates:
+        title = law.get("title", "")
+        article_list = fetch_article_list(
+            law["law_id"], law.get("law_revision_id", "")
+        )
+        if not article_list:
+            continue  # 条例など原文未収載の法令はスキップ
+        emit(f"📖 条文照合: 「{title}」の適用範囲・閾値条文を取得中...")
+        listing = "\n".join(f'- {a["ref"]}{a["caption"]}' for a in article_list)
+        try:
+            sel: ArticleSelection = selector_llm.invoke([
+                SystemMessage(PRE_SYNTHESIS_ARTICLE_SYSTEM),
+                HumanMessage(
+                    f"## 法令名\n{title}\n\n"
+                    f"## 設備情報\n{info_str}\n\n"
+                    f"## 調査論点\n{issues_str}\n\n"
+                    f"## 条文一覧（この中からのみ選択すること）\n{listing}"
+                ),
+            ])
+        except Exception:
+            continue
+
+        valid_refs = {a["ref"] for a in article_list}
+        refs = [
+            r for r in dict.fromkeys(normalize_article_ref(a) for a in sel.articles)
+            if r in valid_refs
+        ][:MAX_PREFETCH_ARTICLES]
+        if not refs:
+            continue
+        try:
+            texts = fetch_article_text(law["law_id"], refs, law.get("law_revision_id", ""))
+        except Exception:
+            texts = {}
+        lines = [f"### {title}"]
+        for ref in refs:
+            t = (texts.get(ref) or "").strip()
+            if t:
+                lines.append(f"◆ {ref}\n{t[:600]}")
+        if len(lines) > 1:
+            blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
+
+
+# ─── 届出先出典の解決 ─────────────────────────────────────────────
+def _attach_delivery_sources(law_items: list, search_results: list) -> None:
+    """deliveries.authority_source_id（[R◯]）を検索結果のURL・タイトルに解決して付与する（in-place）。
+    LLMにURLを直接書かせるとハルシネーションするため、IDで参照させて
+    実在する検索結果から決定的に解決する。実在しないIDはリンクなしになるだけ。"""
+    by_id = {
+        f"R{i}": r for i, r in enumerate(search_results[:MAX_SEARCH_RESULTS], 1)
+    }
+    for law in law_items:
+        for d in law.get("deliveries", []):
+            sid = str(d.get("authority_source_id", "") or "").strip().strip("[]")
+            r = by_id.get(sid)
+            if r and r.get("url"):
+                d["authority_source_url"]   = r["url"]
+                d["authority_source_title"] = r.get("title", "")
+            else:
+                d["authority_source_url"]   = ""
+                d["authority_source_title"] = ""
+
+
 # ─── ノード: 結果統合 ─────────────────────────────────────────────
 def synthesis_node(state: AppState) -> dict:
     """検索結果を統合してアクションアイテムを生成し、state に保存する。
@@ -839,21 +1046,48 @@ def synthesis_node(state: AppState) -> dict:
     条番号グラウンディング）が再実行され、確認した law_items とレポートに
     載る law_items がズレる・承認後の待ち時間とコストが倍になるため分離。"""
     structured_llm = _llm(max_tokens=16000).with_structured_output(SynthesisResult)
+    emit = _make_emit()
 
     equipment_info = state.get("equipment_info", {})
     search_results = state.get("search_results", [])
     issues         = state.get("issues", [])
     policy_note    = state.get("policy_note", "")
 
+    # 統合前に主要候補法令の条文を取得し、適用判断・数量閾値照合の根拠にする
+    # （e-Gov検索結果は法令名のみで、これが無いと判断がLLMの記憶頼みになる）。
+    # 再調査後の再統合で法令候補が変わっていなければ前回の抜粋を再利用し、
+    # 条文選択LLM呼び出し（最大8回）を省く
+    egov_law_ids = sorted({
+        r.get("law_id") for r in search_results
+        if r.get("source", "").startswith("e-Gov") and r.get("law_id")
+    })
+    cache = state.get("prefetch_cache") or {}
+    if cache.get("law_ids") == egov_law_ids and cache.get("excerpts"):
+        article_excerpts = cache["excerpts"]
+        emit("📖 条文照合: 前回取得済みの条文抜粋を再利用します")
+    else:
+        priority_keywords = (
+            set(state.get("search_keywords", []) or [])
+            | set(get_suggested_keywords(equipment_info))
+        )
+        try:
+            article_excerpts = _prefetch_article_excerpts(
+                equipment_info, issues, search_results, priority_keywords, emit,
+            )
+        except Exception:
+            article_excerpts = ""
+
+    emit("🧩 条文抜粋と調査結果をもとに、法令別の対応事項を統合中...")
     context = (
         f"【設備情報】\n{json.dumps(equipment_info, ensure_ascii=False, indent=2)}\n\n"
         f"【確認が必要な論点】\n{json.dumps(issues, ensure_ascii=False)}\n\n"
         + (f"【担当者からの追記指示（最優先で反映）】\n{policy_note}\n\n" if policy_note else "")
-        + f"【e-Gov・Web 調査結果（抜粋）】\n"
+        + (f"【主要候補法令の条文抜粋（e-Gov原文）】\n{article_excerpts}\n\n" if article_excerpts else "")
+        + f"【e-Gov・Web・社内文書 調査結果（抜粋・[R◯]は出典ID）】\n"
         + "\n".join(
-            f"- {r.get('title','?')} ({r.get('source','?')})"
-            + (f"\n  概要: {r.get('snippet','')[:300]}" if r.get('snippet') else "")
-            for r in search_results[:40]
+            f"- [R{i}] {r.get('title','?')} ({r.get('source','?')})"
+            + (f"\n  概要: {r.get('snippet','')[:400]}" if r.get('snippet') else "")
+            for i, r in enumerate(search_results[:MAX_SEARCH_RESULTS], 1)
         )
     )
 
@@ -880,7 +1114,11 @@ def synthesis_node(state: AppState) -> dict:
         elif e.law_name not in existing_names:
             law_items.append({
                 "law_name":         e.law_name,
-                "applicability":    f"{e.reason} 設備情報を確認のうえ適用要否の判定が必要。",
+                "applicability": (
+                    "AIは非該当の可能性が高いと判断しましたが、判断材料が不足して"
+                    "いるため断定せず「要確認」としています。設備情報を確認のうえ"
+                    f"適用要否を判定してください。（AIの判断内容：{e.reason}）"
+                ),
                 "priority":         "check",
                 "relevant_articles": [],
                 "deliveries":       [],
@@ -921,11 +1159,17 @@ def synthesis_node(state: AppState) -> dict:
     # 条番号をe-Gov原文と照合して確定（LLM知識由来の条番号ハルシネーション防止）
     _ground_relevant_articles(law_items)
 
+    # 届出先の出典ID（[R◯]）を実在する検索結果のURL・タイトルに解決
+    _attach_delivery_sources(law_items, search_results)
+
     return {
         "law_items":         law_items,
         "synthesis_summary": result.summary,
         "risk_count":        result.risk_count.model_dump(),
-        "excluded_laws":     [e.model_dump() for e in result.excluded_laws],
+        # LLM生出力ではなく、情報不足の非該当を「要確認」へ昇格させた後の
+        # 選別済みリストを返す（生出力を返すと要確認と非該当に二重掲載される）
+        "excluded_laws":     excluded_laws,
+        "prefetch_cache":    {"law_ids": egov_law_ids, "excerpts": article_excerpts},
         "phase":             "results_review",
     }
 
@@ -942,6 +1186,7 @@ def results_review_node(state: AppState) -> dict:
         "risk_count":       state.get("risk_count", {}),
         "excluded_laws":    state.get("excluded_laws", []),
         "uncovered_issues": state.get("uncovered_issues", []),
+        "issues":           state.get("issues", []),   # 網羅性チェック表示用
     })
 
     # 「足りない・再調査して」依頼なら検索フェーズに戻す
@@ -979,7 +1224,8 @@ def _refine_law_items(law_items: list, equipment_info: dict, instruction: str) -
         f"【担当者からの文面修正依頼】\n{instruction}\n\n"
         "上記の依頼に沿って law_items の文面（applicability / item / deadline / responsible など）"
         "を読みやすく修正してください。法令名・条番号(relevant_articles, law_article)・"
-        "届出先(authority)・priority などの事実情報は、依頼で明示されない限り変更しないこと。"
+        "届出先(authority)・届出先の根拠(authority_basis)・priority などの事実情報は、"
+        "依頼で明示されない限り変更しないこと。"
     )
     try:
         res: RefineResult = refine_llm.invoke([SystemMessage(SYNTHESIS_SYSTEM), HumanMessage(ctx)])
@@ -1012,6 +1258,8 @@ def report_node(state: AppState) -> dict:
         case_id=case_id,
         excluded_laws=state.get("excluded_laws", []),
         uncovered_issues=state.get("uncovered_issues", []),
+        summary=state.get("synthesis_summary", ""),
+        issues=state.get("issues", []),
     )
 
     # Human in the loop: レポートレビュー
@@ -1038,6 +1286,8 @@ def report_node(state: AppState) -> dict:
         new_items = _refine_law_items(
             state.get("law_items", []), state.get("equipment_info", {}), refine
         )
+        # スキーマ往復で消えた出典URL・タイトルを authority_source_id から再解決
+        _attach_delivery_sources(new_items, state.get("search_results", []))
         return {
             "messages":  [AIMessage(f"レポート文面の修正依頼を受けました：{refine}\n修正して再生成します...")],
             "law_items": new_items,

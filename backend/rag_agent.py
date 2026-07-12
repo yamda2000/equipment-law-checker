@@ -106,15 +106,15 @@ def agentic_internal_search(
             for c in new:
                 collected[c["id"]] = c
             new_in_round += len(new)
-            emit(f"　└ 📁 [社内RAG{round_no}] 「{q}」→ 新規{len(new)}チャンク")
+            emit(f"　└ 📁 [社内文書検索{round_no}周目] 「{q}」→ 新規{len(new)}件")
 
         if not collected:
-            emit("　└ 📁 [社内RAG] 該当チャンクなし")
+            emit("　└ 📁 [社内文書検索] 該当箇所なし")
             return []
 
         # 追加検索で新規チャンクが得られなければ、再評価しても結果は変わらない
         if round_no > 1 and new_in_round == 0:
-            emit("　└ 📁 [社内RAG] 新規チャンクなし → 前ラウンドの評価で確定")
+            emit("　└ 📁 [社内文書検索] 新しい該当箇所なし → 前回の評価で確定")
             break
 
         # ③ 関連性評価・充足判断
@@ -134,7 +134,7 @@ def agentic_internal_search(
             ])
         except Exception:
             logger.exception("Agentic RAG の関連性評価に失敗（%dラウンド目）: %s", round_no, question)
-            emit("　└ ⚠️ [社内RAG] 評価に失敗 → これまでの評価結果で確定します")
+            emit("　└ ⚠️ [社内文書検索] 内容の評価に失敗 → これまでの評価結果で確定します")
             break
         graded_ok = True
         relevant_ids = {i for i in assessment.relevant_ids if i in collected}
@@ -146,11 +146,11 @@ def agentic_internal_search(
         ][:2]
         if assessment.sufficient or not followups or round_no == MAX_RAG_ROUNDS:
             emit(
-                f"　└ 📁 [社内RAG] 評価完了（{round_no}ラウンド・"
-                f"関連チャンク {len(relevant_ids)}/{len(collected)}件）"
+                f"　└ 📁 [社内文書検索] 確認完了（{round_no}周・"
+                f"関連する記載 {len(relevant_ids)}/{len(collected)}件）"
             )
             break
-        emit("　└ 📁 [社内RAG] 情報不足と判断 → 追加検索へ")
+        emit("　└ 📁 [社内文書検索] 情報不足と判断 → 別の言葉で再検索")
         queries = followups
 
     if not graded_ok:

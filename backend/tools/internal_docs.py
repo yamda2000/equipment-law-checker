@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 INDEX_DIR = Path(__file__).resolve().parents[2] / "internal_docs_index"
 REGISTRY_PATH = INDEX_DIR / "registry.json"
 
+# 1ファイルあたりの登録テキスト上限（埋め込みコストの暴走防止。超過分は切り捨て）
+MAX_DOC_CHARS = 50000
+
 # チャンク分割設定（日本語文書向けの区切り優先順）
 _SPLITTER = RecursiveCharacterTextSplitter(
     chunk_size=800,
@@ -39,19 +42,35 @@ _STORE = None  # プロセス内キャッシュ
 
 # ─── 埋め込みファクトリ（LLM_MODE で OpenAI / Azure を切替）──────
 def _embeddings():
+    """EMBEDDING 系の環境変数を優先し、未設定なら LLM 系の設定にフォールバックする
+    （.env.example の定義と一致させる。埋め込みが LLM と別リソースの構成に対応）。
+    ※ 埋め込みモデルを変更した場合、既存インデックスと次元が合わなくなるため
+    　 社内文書・ケースメモリの再登録が必要。"""
     mode = os.getenv("LLM_MODE", "poc").lower()
     if mode == "prod":
         from langchain_openai import AzureOpenAIEmbeddings
         return AzureOpenAIEmbeddings(
             azure_deployment=os.getenv("PROD_EMBEDDING_DEPLOYMENT", ""),
-            azure_endpoint=os.getenv("PROD_LLM_ENDPOINT", ""),
-            api_key=os.getenv("PROD_LLM_API_KEY", ""),
-            openai_api_version=os.getenv("PROD_LLM_API_VERSION", "2024-02-01"),
+            azure_endpoint=(
+                os.getenv("PROD_EMBEDDING_ENDPOINT", "")
+                or os.getenv("PROD_LLM_ENDPOINT", "")
+            ),
+            api_key=(
+                os.getenv("PROD_EMBEDDING_API_KEY", "")
+                or os.getenv("PROD_LLM_API_KEY", "")
+            ),
+            openai_api_version=(
+                os.getenv("PROD_EMBEDDING_API_VERSION", "")
+                or os.getenv("PROD_LLM_API_VERSION", "2024-02-01")
+            ),
         )
     from langchain_openai import OpenAIEmbeddings
     return OpenAIEmbeddings(
         model=os.getenv("POC_EMBEDDING_MODEL", "text-embedding-3-small"),
-        api_key=os.getenv("POC_LLM_API_KEY"),
+        api_key=(
+            os.getenv("POC_EMBEDDING_API_KEY")
+            or os.getenv("POC_LLM_API_KEY")
+        ),
     )
 
 
@@ -125,13 +144,14 @@ def internal_docs_available() -> bool:
 # ─── 登録・削除 ───────────────────────────────────────────────────
 def ingest_files(files: list[tuple[str, bytes]]) -> dict:
     """[(ファイル名, バイト列), ...] を抽出→分割→埋め込みして登録する。
-    返り値: {"added": [名前], "skipped": [名前(登録済み)], "failed": [名前(抽出不可)]}
+    返り値: {"added": [名前], "skipped": [名前(登録済み)],
+             "failed": [名前(抽出不可)], "truncated": [名前(上限で切り捨て)]}
     """
     # 循環importを避けるため遅延import（doc_intake → workflow → tools）
     from backend.doc_intake import extract_text_from_file
 
     global _STORE
-    added, skipped, failed = [], [], []
+    added, skipped, failed, truncated = [], [], [], []
 
     with _LOCK:
         reg = _load_registry()
@@ -146,6 +166,9 @@ def ingest_files(files: list[tuple[str, bytes]]) -> dict:
             if not text.strip():
                 failed.append(name)
                 continue
+            if len(text) > MAX_DOC_CHARS:
+                text = text[:MAX_DOC_CHARS]
+                truncated.append(name)
 
             chunks = _SPLITTER.split_text(text)
             ids = [f"{sha1}-{i}" for i in range(len(chunks))]
@@ -179,7 +202,7 @@ def ingest_files(files: list[tuple[str, bytes]]) -> dict:
         if added:
             _save_registry(reg)
 
-    return {"added": added, "skipped": skipped, "failed": failed}
+    return {"added": added, "skipped": skipped, "failed": failed, "truncated": truncated}
 
 
 def delete_file(name: str) -> bool:

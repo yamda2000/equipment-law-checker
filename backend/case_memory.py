@@ -18,24 +18,9 @@ import threading
 from langchain_core.documents import Document
 
 import backend.tools.internal_docs as _idocs
+from backend.fields import FIELD_JA as _FIELD_JA
 
 logger = logging.getLogger(__name__)
-
-# 検索用プロファイルの項目名（workflow.HEARING_FIELD_JA と対応。
-# workflow を import すると循環参照になるためここに定義する）
-_FIELD_JA = {
-    "equipment_type":     "設備の種類",
-    "installation_place": "設置場所",
-    "operation_purpose":  "用途・目的",
-    "scheduled_date":     "稼働開始予定日",
-    "chemicals":          "薬品・溶剤・ガス・燃料",
-    "fire_exhaust":       "火気・熱源・排気・粉じん",
-    "wastewater":         "排水・廃液・廃棄物",
-    "noise_vibration":    "騒音・振動",
-    "radiation":          "放射線・X線",
-    "construction":       "建屋改修・電気工事・配管工事",
-    "additional_info":    "その他の情報",
-}
 
 _LOCK = threading.Lock()
 _STORE = None

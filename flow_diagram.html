@@ -304,8 +304,9 @@
         </div>
       </div>
       <div class="stage">
-        <div class="stage-head">4-3. 網羅性検証</div>
+        <div class="stage-head">4-3. 情報補完・網羅性検証</div>
         <ul>
+          <li>公式ページ（.go.jp / .lg.jp）の本文を取得し、条例・手続き情報の中身を補完</li>
           <li>論点ごとに対応情報が集まったか最終チェック（LLM自己申告とは独立）</li>
           <li>未カバー論点は補完検索（最大5件）。それでも残れば結果確認・レポートに明示</li>
         </ul>
@@ -323,6 +324,8 @@
       <span class="code">workflow.py: synthesis_node</span>
     </div>
     <ul>
+      <li><b>条文照合</b>: 統合前に主要候補法令の条文（適用範囲・届出義務・数量閾値）を
+          e-Gov 原文から取得し、設備の数量（冷媒充填量など）を閾値と照合して判定</li>
       <li>法令ごとに「適用理由・届出・申請・社内対応・優先度」を整理</li>
       <li>主要11法令領域は<b>該当 or 非該当（理由つき）</b>のどちらかに必ず振り分け（確認漏れ防止）</li>
       <li><b>条番号グラウンディング</b>: e-Gov 原文の条一覧と照合し、実在しない条番号を除去</li>
@@ -357,7 +360,8 @@
       <span class="code">workflow.py: report_node（interrupt）／report_gen.py</span>
     </div>
     <ul>
-      <li>HTML レポートを生成（条文全文・章見出し・非該当法令・免責事項つき）</li>
+      <li>HTML レポートを生成（総括・バッジの読み方・<b>対応チェックリスト（時系列）</b>・
+          条文全文（折りたたみ）・非該当法令・免責事項つき）</li>
     </ul>
     <div class="outcomes">
       <span class="oc">承認 → STEP 7 完了へ</span>
@@ -376,7 +380,7 @@
       <span class="code">case_memory.py: save_case</span>
     </div>
     <ul>
-      <li>レポートをダウンロードして担当部署へ共有</li>
+      <li>レポートをダウンロードして担当部署へ共有（outputs/ にも自動保存）</li>
       <li>🧠 承認済みの結論（設備プロファイル・該当法令・非該当判断）を<b>事例として自動保存</b></li>
       <li>次回の類似案件の STEP 2 で想起される → <b>使うほど賢くなる学習ループ（CBR）</b></li>
     </ul>
@@ -417,5 +421,6 @@
 <footer>
   ワークフロー実装: backend/workflow.py（LangGraph・MemorySaver チェックポイント）／ UI: app.py（Streamlit）。
   担当者確認の3箇所（STEP 3・5′・6）は LangGraph の interrupt で一時停止し、承認・依頼の入力で再開する。
+  サイドバーには LLM・Gemini Web検索のトークン数と概算コスト（$／円）を案件単位で表示する。
 </footer>
 </div>

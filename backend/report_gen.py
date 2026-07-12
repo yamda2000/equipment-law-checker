@@ -1,6 +1,7 @@
 """HTMLレポート生成"""
 
 from datetime import datetime
+import html as html_lib
 import json
 import re
 import uuid
@@ -39,6 +40,11 @@ def _to_ja_fields(text: str) -> str:
     return text
 
 
+def _esc(text) -> str:
+    """LLM出力・e-Gov条文・Web検索スニペット等をHTMLに挿入する前のエスケープ。"""
+    return html_lib.escape(str(text or ""))
+
+
 def generate_html_report(
     equipment_info: dict,
     law_items: list,
@@ -48,6 +54,8 @@ def generate_html_report(
     feedback_note: str = "",
     excluded_laws: list = None,
     uncovered_issues: list = None,
+    summary: str = "",
+    issues: list = None,
 ) -> str:
     """法令別アクションアイテムから HTML レポートを生成する"""
     now = datetime.now()
@@ -56,16 +64,18 @@ def generate_html_report(
     feedback_html = (
         f'<div style="background:#E3F2FD;border-left:4px solid #1565C0;padding:14px 18px;'
         f'border-radius:6px;margin:16px 0;font-size:13px;color:#0D47A1;">'
-        f'<strong>📝 担当者からの補足・修正メモ</strong><br>{feedback_note}</div>'
+        f'<strong>📝 担当者からの補足・修正メモ</strong><br>{_esc(feedback_note)}</div>'
         if feedback_note else ""
     )
 
     info_rows      = _build_info_rows(equipment_info)
+    intro_html     = _build_intro(summary)
+    checklist_html = _build_action_checklist(law_items)
     summary_html   = _build_summary(law_items)
     law_html       = _build_law_items(law_items)
     unknown_html   = _build_unknown_items(unknown_items)
     law_refs       = _build_law_refs(search_results)
-    uncovered_html = _build_uncovered_issues(uncovered_issues or [])
+    uncovered_html = _build_coverage_check(issues or [], uncovered_issues or [])
     excluded_html  = _build_excluded_laws(excluded_laws or [])
 
     return f"""<!DOCTYPE html>
@@ -113,6 +123,16 @@ def generate_html_report(
   .summary-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 16px 0; }}
   .summary-box {{ text-align: center; padding: 16px; border-radius: 8px; }}
   .summary-box .num {{ font-size: 36px; font-weight: 900; }}
+  .intro-box {{ background: #EFF3FF; border: 1px solid #C5CAE9; border-left: 5px solid #1565C0;
+                border-radius: 6px; padding: 14px 18px; font-size: 13px; margin: 12px 0; }}
+  .intro-box ul {{ margin: 8px 0 0; padding-left: 20px; }}
+  .intro-box li {{ margin: 3px 0; }}
+  .checklist {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 13px; }}
+  .checklist th {{ background: #E8EAF6; border: 1px solid #e0e0e0; padding: 6px 8px;
+                   font-size: 12px; text-align: left; }}
+  .checklist td {{ border: 1px solid #e0e0e0; padding: 6px 8px; vertical-align: top; }}
+  .checklist .cat td {{ background: #1565C0; color: white; font-weight: 700; font-size: 13px; }}
+  .checklist .cb {{ text-align: center; width: 30px; font-size: 16px; color: #555; }}
   @media print {{ body {{ padding: 0; background: white; }}
                   .container {{ box-shadow: none; padding: 16px; }} }}
 </style>
@@ -128,6 +148,8 @@ def generate_html_report(
   <tr><td>調査対象</td><td>横浜市内会社施設</td></tr>
 </table>
 
+{intro_html}
+
 {feedback_html}
 
 <h2>📋 設備情報</h2>
@@ -135,6 +157,8 @@ def generate_html_report(
 
 <h2>📊 対応サマリー</h2>
 {summary_html}
+
+{checklist_html}
 
 {uncovered_html}
 
@@ -182,8 +206,123 @@ def _build_info_rows(info: dict) -> str:
     rows = ""
     for key, label in labels.items():
         val = info.get(key, "―")
-        rows += f"<tr><td>{label}</td><td>{val}</td></tr>"
+        rows += f"<tr><td>{label}</td><td>{_esc(val)}</td></tr>"
     return rows
+
+
+def _build_intro(summary: str) -> str:
+    """レポート冒頭の「はじめにお読みください」ブロック。
+    法令に詳しくない担当者向けに、総括とバッジの読み方を最初に示す。"""
+    summary_p = (
+        f'<p style="margin:0 0 10px;line-height:1.8;"><strong>【総括】</strong>'
+        f'{_esc(_to_ja_fields(summary))}</p>'
+        if summary else ""
+    )
+    return (
+        f'<h2>📖 はじめにお読みください（このレポートの読み方）</h2>'
+        f'<div class="intro-box">'
+        f'{summary_p}'
+        f'<ul>'
+        f'<li><span class="badge badge-required">🔴 必須対応</span>　この設備に適用され、'
+        f'<strong>稼働前に届出・対応が必要</strong>と判断した法令です。</li>'
+        f'<li><span class="badge badge-check">🟡 要確認</span>　適用される可能性があり、'
+        f'<strong>仕様・数量などの確定後に判定が必要</strong>な法令です。放置せず、記載の確認事項を確かめてください。</li>'
+        f'<li>まず「✅ 対応チェックリスト」で<strong>何を・いつまでに・どこへ</strong>を確認し、'
+        f'詳細と根拠条文は「⚖️ 法令別 届出・対応事項」をご覧ください。</li>'
+        f'<li>本レポートはAIによる参考情報です。最終判断は担当部署・所轄機関にご確認ください。</li>'
+        f'</ul>'
+        f'</div>'
+    )
+
+
+# 対応チェックリストの期限カテゴリ（表示順）
+_TIMELINE_ORDER = ["設置・工事の前", "稼働開始の前", "稼働後・定期", "期限未確定（要確認）"]
+
+
+def _deadline_category(deadline: str) -> str:
+    """期限の文言を時系列カテゴリに分類する（キーワードベース）。"""
+    d = str(deadline or "")
+    if ("工事" in d and "前" in d) or ("設置" in d and "前" in d) or "着工" in d:
+        return "設置・工事の前"
+    if (("稼働" in d or "使用開始" in d or "運転開始" in d) and "前" in d) \
+            or re.search(r"(ヶ月|か月|カ月|日)前", d):
+        return "稼働開始の前"
+    if "後" in d or "毎年" in d or "定期" in d or "年度" in d or "以内" in d:
+        return "稼働後・定期"
+    return "期限未確定（要確認）"
+
+
+def _build_action_checklist(law_items: list) -> str:
+    """全法令の届出・社内対応を期限の時系列で1つの表に統合する。
+    「結局、何を・いつまでに・どこへ」に一目で答えるための一覧。"""
+    rows_by_cat: dict = {c: [] for c in _TIMELINE_ORDER}
+    for law in law_items:
+        law_name = law.get("law_name", "")
+        for d in law.get("deliveries", []):
+            if not d.get("item"):
+                continue
+            rows_by_cat[_deadline_category(d.get("deadline", ""))].append({
+                "kind": "🏛️ 届出",
+                "item": d.get("item", ""),
+                "to": d.get("authority", ""),
+                "deadline": d.get("deadline", ""),
+                "law": law_name,
+                "priority": d.get("priority", law.get("priority", "check")),
+            })
+        for a in law.get("internal_actions", []):
+            if not a.get("item"):
+                continue
+            rows_by_cat[_deadline_category(a.get("deadline", ""))].append({
+                "kind": "🏢 社内",
+                "item": a.get("item", ""),
+                "to": a.get("responsible", ""),
+                "deadline": a.get("deadline", ""),
+                "law": law_name,
+                "priority": "internal",
+            })
+
+    total = sum(len(v) for v in rows_by_cat.values())
+    if total == 0:
+        return ""
+
+    _prio_rank = {"required": 0, "check": 1, "pending": 2, "internal": 3}
+    body = ""
+    for cat in _TIMELINE_ORDER:
+        rows = rows_by_cat[cat]
+        if not rows:
+            continue
+        rows.sort(key=lambda r: _prio_rank.get(r["priority"], 1))
+        body += f'<tr class="cat"><td colspan="6">▼ {cat}（{len(rows)}件）</td></tr>'
+        for r in rows:
+            if r["priority"] == "required":
+                prio_html = '<span class="badge badge-required">必須</span> '
+            elif r["priority"] == "check":
+                prio_html = '<span class="badge badge-check">要確認</span> '
+            elif r["priority"] == "pending":
+                prio_html = '<span class="badge badge-pending">確認中</span> '
+            else:
+                prio_html = ""
+            body += (
+                f'<tr>'
+                f'<td class="cb">☐</td>'
+                f'<td>{prio_html}{_esc(r["item"])}</td>'
+                f'<td style="white-space:nowrap;">{r["kind"]}</td>'
+                f'<td>{_esc(r["to"])}</td>'
+                f'<td>{_esc(r["deadline"])}</td>'
+                f'<td style="font-size:12px;">{_esc(r["law"])}</td>'
+                f'</tr>'
+            )
+
+    return (
+        f'<h2>✅ 対応チェックリスト（時系列）</h2>'
+        f'<div style="font-size:12px;color:#666;margin-bottom:8px;">'
+        f'すべての法令の届出・社内対応を期限順にまとめた一覧です（全{total}件）。'
+        f'印刷してチェック欄としてお使いください。詳細・根拠条文は下の「法令別 届出・対応事項」にあります。</div>'
+        f'<table class="checklist">'
+        f'<tr><th></th><th>対応事項</th><th>種別</th><th>届出先・担当</th><th>期限</th><th>根拠法令</th></tr>'
+        f'{body}'
+        f'</table>'
+    )
 
 
 def _build_summary(law_items: list) -> str:
@@ -251,7 +390,7 @@ def _build_article_block(law: dict) -> str:
         return base + captions.get(base, captions.get(a, ""))
 
     def _art_link(a: str) -> str:
-        a = _with_caption(a)
+        a = _esc(_with_caption(a))
         if law_id:
             return (f'<a href="https://laws.e-gov.go.jp/law/{law_id}" target="_blank" '
                     f'style="color:#1565C0;text-decoration:underline;">{a}</a>')
@@ -262,8 +401,38 @@ def _build_article_block(law: dict) -> str:
         m = re.match(r"第\d+条(?:の\d+)*", re.sub(r"（[^）]*）", "", a).strip())
         return chapters.get(m.group(0), "") if m else ""
 
+    # 条例・自治体系の法令か（e-Gov 未収載のため案内を出し分ける）
+    is_ordinance = any(k in law_name for k in ("条例", "横浜市", "神奈川県"))
+
     if not relevant_articles:
-        art_str = '<span style="color:#888;">条番号確認中</span>'
+        if law_id:
+            # e-Gov 収載の法令だが、適用未確定などの理由で条文を特定していない
+            art_str = (
+                '<span style="color:#888;">条番号未特定'
+                '<span style="font-size:11px;">'
+                '（この設備に明確に対応する条文を自動特定できませんでした。'
+                '適用要否が未確定の法令で発生します。適用が確定した場合は'
+                '再調査で特定できます。e-Gov で直接確認も可能です）'
+                '</span></span>'
+            )
+        elif is_ordinance:
+            art_str = (
+                '<span style="color:#888;">条番号確認中'
+                '<span style="font-size:11px;">'
+                '（横浜市・神奈川県の条例は e-Gov 未収載のため、原文照合による'
+                '条番号の自動特定ができません。横浜市例規集・神奈川県例規集で'
+                '直接ご確認ください）'
+                '</span></span>'
+            )
+        else:
+            art_str = (
+                '<span style="color:#888;">条番号未特定'
+                '<span style="font-size:11px;">'
+                '（e-Gov でこの名称の法令を特定できませんでした。複数法令の'
+                '総称や名称の揺れで発生します。正式な法令名で e-Gov を'
+                '直接検索してご確認ください）'
+                '</span></span>'
+            )
     elif any(_chapter_of(a) for a in relevant_articles):
         # 条番号の昇順に並べてから章ごとにグルーピング表示
         # （条番号は章立て順に振られているため、章も昇順に並ぶ）
@@ -272,14 +441,14 @@ def _build_article_block(law: dict) -> str:
             _groups.setdefault(_chapter_of(a), []).append(a)
         art_str = "".join(
             '<div style="margin:2px 0;">'
-            + (f'<div style="font-size:12px;color:#555;font-weight:700;">【{ch}】</div>' if ch else "")
+            + (f'<div style="font-size:12px;color:#555;font-weight:700;">【{_esc(ch)}】</div>' if ch else "")
             + '<div style="padding-left:1em;">' + "　".join(_art_link(a) for a in arts) + "</div>"
             + "</div>"
             for ch, arts in _groups.items()
         )
     else:
         art_str = "　".join(_art_link(a) for a in relevant_articles)
-    auth_str = "　/　".join(authorities) if authorities else '<span style="color:#888;">―</span>'
+    auth_str = "　/　".join(_esc(a) for a in authorities) if authorities else '<span style="color:#888;">―</span>'
 
     summary_card = (
         f'<div style="border:1px solid #E0E0E0;border-radius:6px;overflow:hidden;margin:10px 0;">'
@@ -309,32 +478,43 @@ def _build_article_block(law: dict) -> str:
             if _ch and _ch != _last_ch:
                 _rows.append(
                     f'<div style="font-size:12px;color:#555;font-weight:700;'
-                    f'margin:6px 0 4px;">【{_ch}】</div>'
+                    f'margin:6px 0 4px;">【{_esc(_ch)}】</div>'
                 )
             _last_ch = _ch
             _rows.append(
                 f'<div style="margin-bottom:10px;">'
-                f'<div style="font-size:12px;font-weight:700;color:#1565C0;margin-bottom:3px;">{_with_caption(ref)}</div>'
-                f'<div style="font-size:12px;color:#333;line-height:1.75;white-space:pre-wrap;">{text}</div>'
+                f'<div style="font-size:12px;font-weight:700;color:#1565C0;margin-bottom:3px;">{_esc(_with_caption(ref))}</div>'
+                f'<div style="font-size:12px;color:#333;line-height:1.75;white-space:pre-wrap;">{_esc(text)}</div>'
                 f'</div>'
             )
         art_rows = "".join(_rows)
+        # 条文全文は既定で折りたたみ、レポートを流し読みしやすくする
         article_box = (
-            f'<div style="background:#F8F9FA;border-left:3px solid #1565C0;'
+            f'<details style="background:#F8F9FA;border-left:3px solid #1565C0;'
             f'border-radius:0 4px 4px 0;padding:10px 14px;margin:10px 0;">'
-            f'<div style="font-size:11px;color:#888;margin-bottom:6px;">📜 条文（e-Gov）</div>'
-            f'{art_rows}'
-            f'</div>'
+            f'<summary style="cursor:pointer;font-size:12px;color:#1565C0;font-weight:700;">'
+            f'📜 条文を表示する（e-Gov原文・{len(art_pairs)}条）</summary>'
+            f'<div style="margin-top:8px;">{art_rows}</div>'
+            f'</details>'
         )
     else:
-        egov_url = (
-            f"https://laws.e-gov.go.jp/law/{law_id}" if law_id
-            else f"https://laws.e-gov.go.jp/search?lawname={urllib.parse.quote(law_name)}"
-        )
-        article_box = (
-            f'<div style="margin:8px 0;"><a href="{egov_url}" target="_blank" '
-            f'style="font-size:12px;color:#1565C0;">🔗 e-Gov で条文を確認</a></div>'
-        )
+        if law_id:
+            article_box = (
+                f'<div style="margin:8px 0;"><a href="https://laws.e-gov.go.jp/law/{law_id}" '
+                f'target="_blank" style="font-size:12px;color:#1565C0;">🔗 e-Gov で条文を確認</a></div>'
+            )
+        elif is_ordinance:
+            article_box = (
+                '<div style="margin:8px 0;font-size:12px;color:#888;">'
+                '📚 条例の原文は「横浜市例規集」「神奈川県例規集」で検索して'
+                'ご確認ください（e-Gov 未収載）</div>'
+            )
+        else:
+            article_box = (
+                f'<div style="margin:8px 0;"><a '
+                f'href="https://laws.e-gov.go.jp/search?lawname={urllib.parse.quote(law_name)}" '
+                f'target="_blank" style="font-size:12px;color:#1565C0;">🔗 e-Gov で法令名を検索</a></div>'
+            )
 
     return summary_card + article_box
 
@@ -349,7 +529,7 @@ def _build_law_items(law_items: list) -> str:
         cfg = PRIORITY_CONFIG.get(p, PRIORITY_CONFIG["check"])
         badge_class = f"badge-{p}"
         review = law.get("review_decision", "")
-        review_html = f'<span class="review-badge">✅ {review}</span>' if review else ""
+        review_html = f'<span class="review-badge">✅ {_esc(review)}</span>' if review else ""
 
         article_block = _build_article_block(law)
 
@@ -360,15 +540,28 @@ def _build_law_items(law_items: list) -> str:
             dcfg = PRIORITY_CONFIG.get(dp, PRIORITY_CONFIG["check"])
             article_ref = d.get("law_article", "") or "・".join(relevant_articles)
             article_html = (
-                f'<div style="font-size:11px;color:#283593;margin:2px 0;">📖 根拠条文：<strong>{law.get("law_name","")} {article_ref}</strong></div>'
+                f'<div style="font-size:11px;color:#283593;margin:2px 0;">📖 根拠条文：<strong>{_esc(law.get("law_name",""))} {_esc(article_ref)}</strong></div>'
                 if article_ref else
                 f'<div style="font-size:11px;color:#888;margin:2px 0;">📖 根拠条文：条文番号不明（e-Gov で要確認）</div>'
             )
+            basis = d.get("authority_basis", "")
+            src_url = d.get("authority_source_url", "")
+            src_link = (
+                f'　<a href="{_esc(src_url)}" target="_blank" style="color:#1565C0;">🔗 '
+                f'{_esc((d.get("authority_source_title") or "出典ページ")[:40])}</a>'
+                if src_url else ""
+            )
+            basis_html = (
+                f'<div style="font-size:11px;color:#607D8B;margin-top:2px;line-height:1.6;">'
+                f'└ 届出先の根拠：{_esc(basis)}{src_link}</div>'
+                if (basis or src_url) else ""
+            )
             deliveries_html += (
                 f'<div class="delivery-row">'
-                f'<span class="badge badge-{dp}">{dcfg["label"]}</span> {d.get("item", "")}'
+                f'<span class="badge badge-{dp}">{dcfg["label"]}</span> {_esc(d.get("item", ""))}'
                 f'{article_html}'
-                f'<div class="delivery-meta">🏛️ 届出先：{d.get("authority", "")}　⏰ 期限：{d.get("deadline", "")}</div>'
+                f'<div class="delivery-meta">🏛️ 届出先：{_esc(d.get("authority", ""))}　⏰ 期限：{_esc(d.get("deadline", ""))}</div>'
+                f'{basis_html}'
                 f'</div>'
             )
 
@@ -376,8 +569,8 @@ def _build_law_items(law_items: list) -> str:
         for act in law.get("internal_actions", []):
             internal_html += (
                 f'<div class="internal-row">'
-                f'● {act.get("item", "")}'
-                f'<div class="internal-meta">⏰ 期限：{act.get("deadline", "")}</div>'
+                f'● {_esc(act.get("item", ""))}'
+                f'<div class="internal-meta">⏰ 期限：{_esc(act.get("deadline", ""))}</div>'
                 f'</div>'
             )
 
@@ -385,10 +578,10 @@ def _build_law_items(law_items: list) -> str:
 <div class="law-card" style="background:{cfg['color']};border-color:{cfg['border']}">
   <div class="law-title">
     <span class="badge {badge_class}">{cfg['label']}</span>
-    {law.get('law_name', '')}
+    {_esc(law.get('law_name', ''))}
     {review_html}
   </div>
-  <div class="law-applicability">📌 {law.get('applicability', '')}</div>
+  <div class="law-applicability">📌 {_esc(law.get('applicability', ''))}</div>
   {article_block}
   {'<div class="section-label">📋 届出・申請事項</div>' + deliveries_html if deliveries_html else '<div class="section-label" style="color:#888">📋 届出・申請事項なし（要確認）</div>'}
   {'<div class="section-label">🏢 社内対応事項</div>' + internal_html if internal_html else ''}
@@ -396,21 +589,73 @@ def _build_law_items(law_items: list) -> str:
     return html
 
 
-def _build_uncovered_issues(items: list) -> str:
-    """網羅性検証で対応情報が見つからなかった論点。担当者による手動確認を促す。"""
-    if not items:
+def _build_coverage_check(issues: list, uncovered: list) -> str:
+    """網羅性チェックの結果。論点ごとの✅/⚠️判定を明示し、
+    OKの場合も「チェックしてOKだった」ことが分かるように表示する。"""
+    if not issues and not uncovered:
         return ""
-    rows = "".join(
-        f'<li style="margin-bottom:6px;line-height:1.6;">{_to_ja_fields(item)}</li>' for item in items
+
+    covered_n = len([i for i in issues if i not in uncovered])
+
+    # 判定サマリー（OK: 緑 / NG: 赤）
+    if issues and not uncovered:
+        summary_box = (
+            f'<div style="background:#E8F5E9;border:1px solid #A5D6A7;border-left:5px solid #2E7D32;'
+            f'border-radius:6px;padding:12px 18px;font-size:13px;color:#1B5E20;">'
+            f'<strong>✅ チェック結果 OK：</strong>調査論点 {len(issues)}件すべてについて、'
+            f'対応する法令・情報の収集を確認しました。</div>'
+        )
+    else:
+        ng_rows = "".join(
+            f'<li style="margin-bottom:6px;line-height:1.6;">{_to_ja_fields(_esc(item))}</li>'
+            for item in uncovered
+        )
+        head = (
+            f'調査論点 {len(issues)}件中 {covered_n}件はカバー済み。'
+            f'<strong>下記 {len(uncovered)}件は対応する法令・情報を確認できませんでした。</strong>'
+            if issues else
+            '<strong>以下の論点は、AI調査で対応する法令・情報を確認できませんでした。</strong>'
+        )
+        summary_box = (
+            f'<div style="background:#FFEBEE;border:1px solid #EF9A9A;border-left:5px solid #C62828;'
+            f'border-radius:6px;padding:14px 18px;font-size:13px;">'
+            f'<strong>🚨 チェック結果 NG：</strong>{head}<br>'
+            f'確認漏れ・届出漏れを防ぐため、<strong>担当部署・所轄機関への直接確認</strong>を行ってください。'
+            f'<ul style="margin:10px 0 0;padding-left:20px;">{ng_rows}</ul>'
+            f'</div>'
+        )
+
+    # 論点別の判定一覧
+    detail_rows = ""
+    for i in issues:
+        if i in uncovered:
+            detail_rows += (
+                f'<tr style="background:#FFEBEE;">'
+                f'<td style="white-space:nowrap;color:#B71C1C;font-weight:700;">⚠️ 未カバー</td>'
+                f'<td>{_to_ja_fields(_esc(i))}　<span style="color:#B71C1C;">（手動確認を推奨）</span></td></tr>'
+            )
+        else:
+            detail_rows += (
+                f'<tr><td style="white-space:nowrap;color:#2E7D32;font-weight:700;">✅ カバー済み</td>'
+                f'<td>{_to_ja_fields(_esc(i))}</td></tr>'
+            )
+    detail_table = (
+        f'<details style="margin-top:8px;">'
+        f'<summary style="cursor:pointer;font-size:12px;color:#1565C0;font-weight:700;">'
+        f'🧮 論点別の判定を表示（全{len(issues)}件）</summary>'
+        f'<table class="info-table" style="margin-top:8px;">'
+        f'<tr><td style="width:15%;">判定</td><td>調査論点</td></tr>{detail_rows}</table>'
+        f'</details>'
+        if issues else ""
     )
+
+    color = "#2E7D32" if (issues and not uncovered) else "#C62828"
     return (
-        f'<h2 style="color:#C62828;border-left-color:#C62828;">🚨 対応法令を確認できなかった論点</h2>'
-        f'<div style="background:#FFEBEE;border:1px solid #EF9A9A;border-left:5px solid #C62828;'
-        f'border-radius:6px;padding:14px 18px;font-size:13px;">'
-        f'<strong>以下の論点は、AI調査（e-Gov・Web検索）で対応する法令・情報を確認できませんでした。</strong><br>'
-        f'確認漏れ・届出漏れを防ぐため、<strong>担当部署・所轄機関への直接確認</strong>を行ってください。'
-        f'<ul style="margin:10px 0 0;padding-left:20px;">{rows}</ul>'
-        f'</div>'
+        f'<h2 style="color:{color};border-left-color:{color};">🧮 網羅性チェック（調査論点のカバー状況）</h2>'
+        f'<div style="font-size:12px;color:#666;margin-bottom:8px;">'
+        f'調査開始前に洗い出した論点ごとに、対応する法令・情報を収集できたかを'
+        f'AIの調査完了判断とは独立に検証した結果です。</div>'
+        f'{summary_box}{detail_table}'
     )
 
 
@@ -419,8 +664,8 @@ def _build_excluded_laws(items: list) -> str:
     if not items:
         return ""
     rows = "".join(
-        f'<tr><td style="white-space:nowrap;font-weight:600;">{e.get("law_name", "")}</td>'
-        f'<td>{_to_ja_fields(e.get("reason", ""))}</td></tr>'
+        f'<tr><td style="white-space:nowrap;font-weight:600;">{_esc(e.get("law_name", ""))}</td>'
+        f'<td>{_to_ja_fields(_esc(e.get("reason", "")))}</td></tr>'
         for e in items
     )
     return (
@@ -439,7 +684,7 @@ def _build_unknown_items(items: list) -> str:
     if not items:
         return ""
     return "".join(
-        f'<div class="unknown-item">❓ {item}</div>' for item in items
+        f'<div class="unknown-item">❓ {_esc(item)}</div>' for item in items
     )
 
 
@@ -448,10 +693,10 @@ def _build_law_refs(search_results: list) -> str:
     if not refs:
         return ""
     html = ""
-    for r in refs[:15]:
+    for r in refs:
         url = r.get("url", "")
-        title = r.get("title", "")
-        source = r.get("source", "")
-        link = f'<a href="{url}" target="_blank">{title}</a>' if url else title
+        title = _esc(r.get("title", ""))
+        source = _esc(r.get("source", ""))
+        link = f'<a href="{_esc(url)}" target="_blank">{title}</a>' if url else title
         html += f'<div class="law-ref">📖 {link} <span style="color:#888">({source})</span></div>'
     return html

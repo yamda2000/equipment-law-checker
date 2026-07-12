@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, os.path.dirname(__file__))
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_community.callbacks import get_openai_callback
 from langgraph.types import Command
 
 from backend.workflow import (
@@ -42,6 +43,7 @@ from backend.tools.internal_docs import (
     delete_all as delete_all_internal_docs,
 )
 from backend.case_memory import list_cases, delete_case
+from backend.tools.web_search import get_gemini_usage
 
 # ─────────────────────────────────────────
 # ページ設定
@@ -193,6 +195,8 @@ def init():
         "api_key_ok":       bool(
             os.getenv("POC_LLM_API_KEY") or os.getenv("PROD_LLM_API_KEY")
         ),
+        # Gemini Web検索コストの差分計算用（セッション開始時点の累積値）
+        "web_usage_baseline": get_gemini_usage(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -257,6 +261,59 @@ def _save_phase_idata(idata: dict):
 
 
 # ─────────────────────────────────────────
+# LLM 使用量・コストの積算
+# ─────────────────────────────────────────
+def _record_llm_usage(cb) -> None:
+    """get_openai_callback の計測結果を案件単位で積算する。
+    Azure等でモデル単価が取得できず cost=0 の場合は、環境変数の単価
+    （LLM_COST_INPUT_PER_1M / LLM_COST_OUTPUT_PER_1M、USD/100万トークン）で概算する。"""
+    cost = cb.total_cost
+    if not cost and (cb.prompt_tokens or cb.completion_tokens):
+        in_rate  = float(os.getenv("LLM_COST_INPUT_PER_1M",  "2.5"))
+        out_rate = float(os.getenv("LLM_COST_OUTPUT_PER_1M", "10.0"))
+        cost = cb.prompt_tokens / 1e6 * in_rate + cb.completion_tokens / 1e6 * out_rate
+    usage = st.session_state.setdefault(
+        "llm_usage", {"prompt": 0, "completion": 0, "cost": 0.0, "calls": 0}
+    )
+    usage["prompt"]     += cb.prompt_tokens
+    usage["completion"] += cb.completion_tokens
+    usage["cost"]       += cost
+    usage["calls"]      += cb.successful_requests
+    # Gemini Web検索の使用量も同じタイミングで同期する
+    _sync_web_search_usage()
+
+
+def _sync_web_search_usage() -> None:
+    """Gemini Web検索のプロセス累積使用量から、このセッション分の差分を積算する。
+    単価は環境変数（GEMINI_COST_INPUT_PER_1M / GEMINI_COST_OUTPUT_PER_1M、
+    USD/100万トークン。既定は gemini-2.0-flash 相当）で調整できる。
+    検索1回あたりの課金（無料枠超過時）は GEMINI_COST_PER_SEARCH で指定する。"""
+    current = get_gemini_usage()
+    baseline = st.session_state.get("web_usage_baseline") or {
+        "prompt_tokens": 0, "completion_tokens": 0, "requests": 0
+    }
+    d_prompt   = current["prompt_tokens"]     - baseline["prompt_tokens"]
+    d_complete = current["completion_tokens"] - baseline["completion_tokens"]
+    d_requests = current["requests"]          - baseline["requests"]
+    if d_prompt or d_complete or d_requests:
+        in_rate    = float(os.getenv("GEMINI_COST_INPUT_PER_1M",  "0.10"))
+        out_rate   = float(os.getenv("GEMINI_COST_OUTPUT_PER_1M", "0.40"))
+        per_search = float(os.getenv("GEMINI_COST_PER_SEARCH",    "0"))
+        web = st.session_state.setdefault(
+            "web_usage", {"prompt": 0, "completion": 0, "requests": 0, "cost": 0.0}
+        )
+        web["prompt"]     += d_prompt
+        web["completion"] += d_complete
+        web["requests"]   += d_requests
+        web["cost"] += (
+            d_prompt / 1e6 * in_rate
+            + d_complete / 1e6 * out_rate
+            + d_requests * per_search
+        )
+    st.session_state.web_usage_baseline = current
+
+
+# ─────────────────────────────────────────
 # LangGraph 呼び出し（ヒアリング中）
 # ─────────────────────────────────────────
 def _rollback_predicted_analysis():
@@ -286,10 +343,15 @@ def invoke_hearing(user_text: str):
 
     try:
         with st.spinner("情報整理・分析中..." if hearing_ending else "AIが考えています..."):
-            workflow.invoke(
-                {"messages": [HumanMessage(content=user_text)]},
-                config=config,
-            )
+            with get_openai_callback() as cb:
+                try:
+                    workflow.invoke(
+                        {"messages": [HumanMessage(content=user_text)]},
+                        config=config,
+                    )
+                finally:
+                    # エラー時も、そこまでに消費したトークンを計上する
+                    _record_llm_usage(cb)
     except Exception:
         logger.error("invoke_hearing でエラー:\n%s", traceback.format_exc())
         add_display("system", "⚠️ AIとの通信でエラーが発生しました。お手数ですが、同じ内容をもう一度送信してください。")
@@ -340,7 +402,11 @@ def start_with_documents(files) -> bool:
                 failed.append(f.name)
         if doc_texts:
             try:
-                extracted = extract_equipment_info(doc_texts)
+                with get_openai_callback() as cb:
+                    try:
+                        extracted = extract_equipment_info(doc_texts)
+                    finally:
+                        _record_llm_usage(cb)
             except Exception:
                 logger.error("資料からの情報抽出でエラー:\n%s", traceback.format_exc())
 
@@ -384,8 +450,13 @@ def render_extract_confirm():
                 f"資料の根拠：{evidence}" if evidence
                 else "資料に記載が見つかりませんでした（空欄のままだとAIが質問します）"
             )
+            # 抽出済み／未記入が一目で分かるようラベルにバッジを付ける
+            status = (
+                "✅ 抽出済み" if field.get("value", "").strip()
+                else "❓ 未記入（この後AIが質問）"
+            )
             values[key] = st.text_input(
-                f"{icon} {label}",
+                f"{icon} {label}　{status}",
                 value=field.get("value", ""),
                 help=help_text,
                 key=f"extract_{key}",
@@ -487,13 +558,18 @@ def resume_graph(decision):
         # 調査フェーズは各ステップの進捗をライブ表示（stream_mode="custom"）
         status = st.status("🔎 AI調査を開始しています...", expanded=True)
         try:
-            for chunk in workflow.stream(
-                Command(resume=decision), config=config, stream_mode="custom"
-            ):
-                entry = chunk.get("progress") if isinstance(chunk, dict) else None
-                if entry:
-                    status.update(label=f"AI調査中... {entry}")
-                    status.write(entry)
+            with get_openai_callback() as cb:
+                try:
+                    for chunk in workflow.stream(
+                        Command(resume=decision), config=config, stream_mode="custom"
+                    ):
+                        entry = chunk.get("progress") if isinstance(chunk, dict) else None
+                        if entry:
+                            status.update(label=f"AI調査中... {entry}")
+                            status.write(entry)
+                finally:
+                    # エラー時も、そこまでに消費したトークンを計上する
+                    _record_llm_usage(cb)
         except Exception as e:
             logger.error("調査フェーズ (workflow.stream) でエラー:\n%s", traceback.format_exc())
             status.update(label="⚠️ 調査中にエラーが発生しました", state="error", expanded=True)
@@ -506,7 +582,11 @@ def resume_graph(decision):
     else:
         try:
             with st.spinner("処理中..."):
-                workflow.invoke(Command(resume=decision), config=config)
+                with get_openai_callback() as cb:
+                    try:
+                        workflow.invoke(Command(resume=decision), config=config)
+                    finally:
+                        _record_llm_usage(cb)
         except Exception:
             logger.error("処理フェーズ (workflow.invoke) でエラー:\n%s", traceback.format_exc())
             add_display("system", "⚠️ 処理中にエラーが発生しました。もう一度お試しください。")
@@ -526,6 +606,20 @@ def resume_graph(decision):
         rhtml = get_state_value(st.session_state.thread_id, "report_html")
         if rhtml:
             st.session_state.report_html = rhtml
+            # レポートを outputs/ に自動保存（「新しい案件」で消える事故を防ぐ）
+            try:
+                case_id = get_state_value(st.session_state.thread_id, "case_id") or "case"
+                os.makedirs("outputs", exist_ok=True)
+                out_path = os.path.join(
+                    "outputs",
+                    f"{datetime.now().strftime('%Y%m%d_%H%M')}_{case_id}_法令確認レポート.html",
+                )
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(rhtml)
+                st.session_state.report_saved_path = out_path
+            except Exception:
+                logger.error("レポートの自動保存に失敗:\n%s", traceback.format_exc())
+                st.session_state.report_saved_path = ""
         st.session_state.ui_phase = "complete"
         st.session_state.interrupt_data = None
         st.session_state.step_idx = 6
@@ -668,6 +762,11 @@ def render_input():
             "AIが資料から設備情報を抽出し、ヒアリングでの手入力を減らせます。"
             "資料がなくてもそのまま開始できます。"
         )
+        st.caption(
+            "💡 サイドバーの「📁 社内文書」に社内規定・過去の届出事例を登録しておくと、"
+            "AIが調査時に社内文書も検索します。また、レポートを承認した案件は"
+            "「🧠 ケースメモリ」に蓄積され、次回の類似案件で自動的に参照されます（使うほど賢くなります）。"
+        )
         files = st.file_uploader(
             "関連資料（PDF / Word / Excel / PowerPoint / テキスト・複数可）",
             type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
@@ -697,6 +796,16 @@ def render_input():
             txt = st.session_state.pop("pending_analysis_text")
             invoke_hearing(txt)
             st.rerun()
+
+        # 残り質問数の表示（先が見えるようにする）
+        expected = st.session_state.get("expected_questions", 11)
+        asked = sum(1 for m in st.session_state.display_messages if m.get("role") == "ai")
+        if expected > 0 and asked > 0:
+            current = min(asked, expected)
+            st.progress(
+                current / expected,
+                text=f"📝 質問 {current} / {expected} 項目（残り {expected - current} 項目）",
+            )
 
         with st.form("hearing_form", clear_on_submit=True):
             txt = st.text_area(
@@ -730,10 +839,21 @@ def render_input():
     # ── 完了 ──
     elif ui == "complete":
         st.success("✅ 全プロセスが完了しました！")
+        if st.session_state.get("report_saved_path"):
+            st.caption(f"💾 レポートは `{st.session_state.report_saved_path}` に自動保存済みです。")
         c1, c2 = st.columns(2)
-        if c1.button("🔄 新しい案件を開始する", use_container_width=True):
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
+        if st.session_state.get("confirm_new_case"):
+            with c1:
+                st.warning("この画面の内容はクリアされます。よろしいですか？")
+                if st.button("はい、新しい案件を開始する", type="primary", use_container_width=True):
+                    for k in list(st.session_state.keys()):
+                        del st.session_state[k]
+                    st.rerun()
+                if st.button("キャンセル", use_container_width=True):
+                    st.session_state.confirm_new_case = False
+                    st.rerun()
+        elif c1.button("🔄 新しい案件を開始する", use_container_width=True):
+            st.session_state.confirm_new_case = True
             st.rerun()
         if st.session_state.report_html:
             from datetime import datetime
@@ -793,6 +913,10 @@ def render_policy_review(idata: dict):
         "上に表示された調査方針の内容をご確認のうえ、問題なければ"
         "「この方針で調査を開始する」を押してください。"
     )
+    st.caption(
+        "💡 内容が難しい場合は、そのまま承認して進めて大丈夫です。"
+        "調査後の「結果確認」「レポート確認」でも内容の確認・修正・再調査を依頼できます。"
+    )
 
     st.divider()
     c1, c2 = st.columns(2)
@@ -833,9 +957,23 @@ def render_results_detail(idata: dict):
     c1.metric("🔴 必須対応", rc.get("required", 0), help="稼働前に必ず届出・対応が必要な法令数")
     c2.metric("🟡 要確認",   rc.get("check", 0),    help="仕様確定後に判断が必要な法令数")
 
-    # 網羅性検証で対応情報が見つからなかった論点（確認漏れリスクとして明示）
+    # 網羅性チェックの結果（論点ごとの✅/⚠️判定を明示。OKの場合もOKと表示する）
+    issues_list = idata.get("issues") or []
     uncovered = idata.get("uncovered_issues") or []
+    covered_n = len([i for i in issues_list if i not in uncovered])
+
+    if issues_list and not uncovered:
+        st.success(
+            f"🧮 網羅性チェック OK：調査論点 {len(issues_list)}件すべてについて、"
+            f"対応する法令・情報の収集を確認しました。"
+        )
     if uncovered:
+        summary_line = (
+            f'網羅性チェック：論点 {len(issues_list)}件中 {covered_n}件はカバー済み。'
+            f'下記 {len(uncovered)}件は対応する法令・情報を確認できませんでした。'
+            if issues_list else
+            'AI調査（e-Gov・Web検索）では下記の論点に対応する法令・情報を確認できませんでした。'
+        )
         items_html = "".join(
             f'<li style="margin-bottom:6px;line-height:1.6;">{html_lib.escape(to_ja_field_names(u))}</li>'
             for u in uncovered
@@ -844,14 +982,36 @@ def render_results_detail(idata: dict):
             f'<div style="border:1px solid #EF9A9A;border-left:6px solid #C62828;'
             f'border-radius:8px;background:#FFEBEE;padding:14px 18px;margin:10px 0;">'
             f'<div style="color:#B71C1C;font-weight:700;font-size:15px;margin-bottom:6px;">'
-            f'🚨 対応法令を確認できなかった論点</div>'
+            f'🚨 網羅性チェック NG：対応法令を確認できなかった論点</div>'
             f'<div style="color:#7F1D1D;font-size:13px;margin-bottom:10px;">'
-            f'AI調査（e-Gov・Web検索）では下記の論点に対応する法令・情報を確認できませんでした。'
-            f'確認漏れ・届出漏れを防ぐため、担当部署・所轄機関への直接確認を推奨します。</div>'
+            f'{summary_line} 確認漏れ・届出漏れを防ぐため、担当部署・所轄機関への直接確認を推奨します。</div>'
             f'<ul style="margin:0;padding-left:20px;color:#4E342E;font-size:14px;">{items_html}</ul>'
             f'</div>',
             unsafe_allow_html=True,
         )
+    if issues_list:
+        with st.expander(
+            f"🧮 網羅性チェックの詳細（論点 {len(issues_list)}件：✅ カバー済み {covered_n} ／ "
+            f"⚠️ 未カバー {len(issues_list) - covered_n}）"
+        ):
+            st.caption(
+                "調査開始前に洗い出した論点ごとに、対応する法令・情報が収集できたかを"
+                "AIの調査完了判断とは独立にチェックした結果です。"
+            )
+            for i in issues_list:
+                if i in uncovered:
+                    st.markdown(
+                        f'<div style="font-size:13px;color:#B71C1C;margin:3px 0;">'
+                        f'⚠️ {html_lib.escape(to_ja_field_names(i))}'
+                        f'　<b>― 対応情報なし（手動確認を推奨）</b></div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div style="font-size:13px;color:#2E7D32;margin:3px 0;">'
+                        f'✅ {html_lib.escape(to_ja_field_names(i))}</div>',
+                        unsafe_allow_html=True,
+                    )
 
     st.divider()
     law_items = idata.get("law_items", [])
@@ -957,8 +1117,38 @@ def render_results_detail(idata: dict):
                 m = re.match(r"第\d+条(?:の\d+)*", re.sub(r"（[^）]*）", "", a).strip())
                 return chapter_map.get(m.group(0), "") if m else ""
 
+            # 条例・自治体系の法令か（e-Gov 未収載のため案内を出し分ける）
+            is_ordinance = any(k in law_name for k in ("条例", "横浜市", "神奈川県"))
+
             if not relevant_articles:
-                art_str = '<span style="color:#888;">条番号確認中</span>'
+                if law_id:
+                    # e-Gov 収載の法令だが、適用未確定などの理由で条文を特定していない
+                    art_str = (
+                        '<span style="color:#888;">条番号未特定'
+                        '<span style="font-size:11px;">'
+                        '（この設備に明確に対応する条文を自動特定できませんでした。'
+                        '適用要否が未確定の法令で発生します。適用が確定した場合は'
+                        '再調査で特定できます。下の e-Gov リンクから直接確認も可能です）'
+                        '</span></span>'
+                    )
+                elif is_ordinance:
+                    art_str = (
+                        '<span style="color:#888;">条番号確認中'
+                        '<span style="font-size:11px;">'
+                        '（横浜市・神奈川県の条例は e-Gov 未収載のため、原文照合による'
+                        '条番号の自動特定ができません。横浜市例規集・神奈川県例規集で'
+                        '直接ご確認ください）'
+                        '</span></span>'
+                    )
+                else:
+                    art_str = (
+                        '<span style="color:#888;">条番号未特定'
+                        '<span style="font-size:11px;">'
+                        '（e-Gov でこの名称の法令を特定できませんでした。複数法令の'
+                        '総称や名称の揺れで発生します。正式な法令名で e-Gov を'
+                        '直接検索してご確認ください）'
+                        '</span></span>'
+                    )
             elif any(_chapter_of(a) for a in relevant_articles):
                 # 条番号の昇順に並べてから章ごとにグルーピング表示
                 # （条番号は章立て順に振られているため、章も昇順に並ぶ）
@@ -991,15 +1181,25 @@ def render_results_detail(idata: dict):
                 unsafe_allow_html=True,
             )
 
-            # 条文インライン表示
-            egov_link_url = (
-                f"https://laws.e-gov.go.jp/law/{law_id}" if law_id
-                else f"https://laws.e-gov.go.jp/search?lawname={urllib.parse.quote(law_name)}"
-            )
-            egov_link_html = (
-                f'<a href="{egov_link_url}" target="_blank" '
-                f'style="font-size:12px;color:#1565C0;">🔗 e-Gov で条文を確認</a>'
-            )
+            # 条文インライン表示。条例は e-Gov 未収載のため、行き止まりになる
+            # e-Gov 検索リンクは出さず、例規集への案内文に切り替える
+            if law_id:
+                egov_link_html = (
+                    f'<a href="https://laws.e-gov.go.jp/law/{law_id}" target="_blank" '
+                    f'style="font-size:12px;color:#1565C0;">🔗 e-Gov で条文を確認</a>'
+                )
+            elif is_ordinance:
+                egov_link_html = (
+                    '<span style="font-size:12px;color:#888;">'
+                    '📚 条例の原文は「横浜市例規集」「神奈川県例規集」で検索して'
+                    'ご確認ください（e-Gov 未収載）</span>'
+                )
+            else:
+                egov_link_html = (
+                    f'<a href="https://laws.e-gov.go.jp/search?lawname={urllib.parse.quote(law_name)}" '
+                    f'target="_blank" style="font-size:12px;color:#1565C0;">'
+                    f'🔗 e-Gov で法令名を検索</a>'
+                )
             # キャッシュには過去の調査ラウンドの条文も残るため、
             # 現在の relevant_articles に含まれる条番号だけを表示する
             art_pairs = [
@@ -1053,6 +1253,19 @@ def render_results_detail(idata: dict):
                         f'<span style="color:#888;">📖 条文番号確認中</span>'
                     )
                     authority_val = d.get("authority", "")
+                    basis = d.get("authority_basis", "")
+                    src_url = d.get("authority_source_url", "")
+                    src_link = (
+                        f'　<a href="{html_lib.escape(src_url)}" target="_blank" '
+                        f'style="color:#1565C0;">🔗 '
+                        f'{html_lib.escape((d.get("authority_source_title") or "出典ページ")[:40])}</a>'
+                        if src_url else ""
+                    )
+                    basis_html = (
+                        f'<div style="margin-top:4px;font-size:11.5px;color:#607D8B;line-height:1.6;">'
+                        f'└ 届出先の根拠：{html_lib.escape(basis)}{src_link}</div>'
+                        if (basis or src_url) else ""
+                    )
                     st.markdown(
                         f'<div style="background:{d_bg};border-left:4px solid {d_border};'
                         f'padding:9px 13px;border-radius:4px;margin:4px 0;">'
@@ -1062,6 +1275,7 @@ def render_results_detail(idata: dict):
                         f'<span style="color:#1B5E20;font-weight:600;">🏛️ {html_lib.escape(authority_val)}</span>'
                         f'<span>⏰ {html_lib.escape(d.get("deadline", ""))}</span>'
                         f'</div>'
+                        f'{basis_html}'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
@@ -1203,6 +1417,35 @@ def render_report_review(idata: dict):
 # ─────────────────────────────────────────
 def render_sidebar():
     with st.sidebar:
+        # AI利用コスト（スクロールせずに見えるよう最上部に表示。詳細は折りたたみ）
+        usage = st.session_state.get("llm_usage")
+        if usage and usage.get("calls"):
+            jpy_rate = float(os.getenv("LLM_COST_JPY_RATE", "150"))
+            web = st.session_state.get("web_usage") or {}
+            total_cost = usage["cost"] + (web.get("cost") or 0.0)
+            web_line = f"　Web検索: {web['requests']}回" if web.get("requests") else ""
+            st.markdown(
+                f'<div class="sidebar-card">'
+                f'💰 <b>AI利用コスト ${total_cost:.3f}</b>'
+                f'（約 {total_cost * jpy_rate:,.0f}円）<br>'
+                f'<span style="font-size:11px;color:#777;">'
+                f'LLM: {usage["calls"]}回{web_line}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            with st.expander("コスト内訳"):
+                st.caption(
+                    f"LLM 入力: {usage['prompt']:,} / 出力: {usage['completion']:,} トークン"
+                    f"　${usage['cost']:.3f}"
+                )
+                if web.get("requests"):
+                    st.caption(
+                        f"Web検索 入力: {web['prompt']:,} / 出力: {web['completion']:,} トークン"
+                        f"　${web['cost']:.3f}"
+                    )
+                st.caption("※ 埋め込み（社内文書登録・検索）のコストは含みません。")
+            st.divider()
+
         st.markdown("## ⚖️ ステップ")
 
         idata = st.session_state.interrupt_data
@@ -1262,6 +1505,11 @@ def render_sidebar():
                     st.info("登録済みのためスキップ: " + "、".join(flash["skipped"]))
                 if flash.get("failed"):
                     st.warning("テキスト抽出不可: " + "、".join(flash["failed"]))
+                if flash.get("truncated"):
+                    st.info(
+                        "サイズ上限（5万字）を超えたため先頭のみ登録: "
+                        + "、".join(flash["truncated"])
+                    )
                 if flash.get("error"):
                     st.error(f"登録に失敗しました: {flash['error']}")
 
@@ -1347,6 +1595,7 @@ def render_sidebar():
                 )
 
         st.divider()
+
         # 案件IDはレポートと同じ case_id を表示する（確定前は thread_id で代用）
         case_id = get_state_value(st.session_state.thread_id, "case_id")
         if case_id:
