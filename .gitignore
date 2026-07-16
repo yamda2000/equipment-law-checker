@@ -10,3 +10,7 @@ data/*.log
 outputs/
 docs/
 internal_docs_index/
+
+# ブラウザ保存ページ・ルート直下に保存された生成レポート
+法令確認AI 処理フロー図*
+*AI作成レポート.html

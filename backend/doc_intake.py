@@ -154,9 +154,10 @@ def _relocate_refrigerant(data: dict) -> dict:
     return data
 
 
-def extract_equipment_info(doc_texts: list) -> dict:
+def extract_equipment_info(doc_texts: list, config: dict | None = None) -> dict:
     """[(ファイル名, 抽出テキスト), ...] からヒアリング11項目を構造化抽出する。
 
+    config: LLM 呼び出しに渡す RunnableConfig（Langfuse の callbacks 等）。
     返り値: {フィールド名: {"value": str, "evidence": str}}
     抽出に失敗した場合は例外を送出する（呼び出し側でフォールバック）。
     """
@@ -170,7 +171,7 @@ def extract_equipment_info(doc_texts: list) -> dict:
     result: DocExtraction = llm.invoke([
         SystemMessage(DOC_EXTRACTION_SYSTEM),
         HumanMessage(f"以下の資料から設備情報を抽出してください。\n\n{combined}"),
-    ])
+    ], config=config or {})
     return _relocate_refrigerant(
         {name: field.model_dump() for name, field in result}
     )

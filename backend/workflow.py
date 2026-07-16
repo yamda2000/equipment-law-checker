@@ -32,7 +32,7 @@ from backend.tools.egov import (
     search_laws_by_keyword, fetch_article_list, fetch_article_text,
     normalize_article_ref, get_suggested_keywords,
 )
-from backend.tools.web_search import search_web, fetch_page_text
+from backend.tools.web_search import search_web
 from backend.tools.internal_docs import search_internal_docs, internal_docs_available
 from backend.rag_agent import agentic_internal_search
 from backend.case_memory import save_case, find_similar_cases, format_cases_for_prompt
@@ -97,10 +97,22 @@ class UncoveredIssue(BaseModel):
     )
 
 
+class CoveredIssue(BaseModel):
+    issue: str = Field(description="カバー済みの論点（入力の論点リストの表記のまま）")
+    covered_by: list[str] = Field(
+        default_factory=list,
+        description="この論点をカバーする収集済み法令・情報のタイトル（一覧の表記のまま・最大3件）",
+    )
+
+
 class CoverageCheck(BaseModel):
     uncovered: list[UncoveredIssue] = Field(
         default_factory=list,
         description="対応情報が見つかっていない論点リスト。全論点カバー済みなら空リスト",
+    )
+    covered: list[CoveredIssue] = Field(
+        default_factory=list,
+        description="カバー済みの論点と、その根拠となった収集済み法令・情報のタイトル",
     )
 
 
@@ -426,6 +438,7 @@ def _process_web_results(
     results: list,
     label: str,
     icon: str = "🌐",
+    suggestions_out: list | None = None,
 ) -> tuple[str, int]:
     """Web・社内文書の検索結果を処理し、エラーと正常結果を判別してログエントリを返す。"""
     # エラー結果の検出
@@ -437,6 +450,15 @@ def _process_web_results(
 
     added = 0
     for r in web_results:
+        # 検索候補（searchEntryPoint）は検索結果とは分離して保持する。
+        # 結果確認画面での表示専用で、統合LLMへの入力・レポートには含めない
+        if r.get("source") == "SearchSuggestions":
+            if suggestions_out is not None and r.get("suggestions_html"):
+                suggestions_out.append({
+                    "query": r.get("query", ""),
+                    "html":  r["suggestions_html"],
+                })
+            continue
         key = r.get("title", "") + r.get("url", "")
         if key not in seen_titles:
             seen_titles.add(key)
@@ -470,6 +492,9 @@ def search_node(state: AppState) -> dict:
     # 実行済みクエリ（同一クエリの再実行は無意味なので記録して弾く）。
     # state から引き継ぐことで、再調査ラウンドでも初回に実行済みのクエリを再実行しない
     executed_queries: set[str] = set(state.get("executed_queries", []) or [])
+    # 検索候補（Google 検索の searchEntryPoint）。Grounding 結果を表示する際に
+    # あわせて表示することが規約で求められるため、結果確認画面用に収集する
+    search_suggestions: list[dict] = list(state.get("search_suggestions", []) or [])
 
     # 進捗のライブ送信（stream_mode="custom"）。invoke 実行時は no-op。
     emit = _make_emit()
@@ -520,7 +545,7 @@ def search_node(state: AppState) -> dict:
             web_results = search_web(local_query)
             executed_queries.add(local_query)
             search_count += 1
-            entry, added = _process_web_results(web_results, local_query, seen_titles, results, "条例Web")
+            entry, added = _process_web_results(web_results, local_query, seen_titles, results, "条例Web", suggestions_out=search_suggestions)
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
             emit(entry)
@@ -531,7 +556,7 @@ def search_node(state: AppState) -> dict:
         web_results = search_web(guideline_query)
         executed_queries.add(guideline_query)
         search_count += 1
-        entry, added = _process_web_results(web_results, guideline_query, seen_titles, results, "ガイドラインWeb")
+        entry, added = _process_web_results(web_results, guideline_query, seen_titles, results, "ガイドラインWeb", suggestions_out=search_suggestions)
         search_log.append(entry)
         progress_messages.append(AIMessage(content=entry, name="search_progress"))
         emit(entry)
@@ -694,31 +719,8 @@ def search_node(state: AppState) -> dict:
             emit(f"🌐 Web検索中:「{action.query}」")
             web_results = search_web(action.query)
             search_count += 1
-            entry, added = _process_web_results(web_results, action.query, seen_titles, results, "AIWeb検索")
+            entry, added = _process_web_results(web_results, action.query, seen_titles, results, "AIWeb検索", suggestions_out=search_suggestions)
             entry = entry.replace("取得", "新規取得")
-            search_log.append(entry)
-            progress_messages.append(AIMessage(content=entry, name="search_progress"))
-            emit(entry)
-
-    # ── 公式ページ本文の補完 ──
-    # Web検索（Gemini Grounding）の結果はタイトルとURLのみで snippet が空のことが
-    # 多く、横浜市・神奈川県条例などの適用判断材料が薄い。公式ドメイン
-    # （.go.jp / .lg.jp）のページ本文を取得して snippet を補完する。
-    enrich_targets = [
-        r for r in results
-        if r.get("url") and r.get("source") == "Gemini Grounding"
-        and len(r.get("snippet", "")) < 50
-    ][:6]
-    if enrich_targets:
-        emit("📄 公式ページ（横浜市・神奈川県・省庁）の本文を取得して補完中...")
-        enriched = 0
-        for r in enrich_targets:
-            page_text = fetch_page_text(r["url"])
-            if page_text:
-                r["snippet"] = page_text
-                enriched += 1
-        if enriched:
-            entry = f"📄 公式ページ本文を{enriched}件取得（条例・手続きの判断材料に使用）"
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
             emit(entry)
@@ -728,28 +730,31 @@ def search_node(state: AppState) -> dict:
     # 突き合わせ、未カバー論点は補完検索する。それでも残った論点は state に
     # 記録し、結果確認画面・レポートで担当者に明示する。
     uncovered_issues: list[str] = []
+    # 論点 → カバー元の法令・情報タイトル（レポート・結果確認でカバー判定の
+    # 妥当性を人が検証できるようにする）
+    issue_coverage: dict = {}
     if issues:
         emit("🧮 論点ごとの網羅性を検証中...")
         coverage_llm = _llm().with_structured_output(CoverageCheck)
 
-        def _run_coverage_check() -> list:
+        def _run_coverage_check() -> CoverageCheck | None:
             issues_str  = "\n".join(f"- {i}" for i in issues)
             results_str = "\n".join(
                 f"- {r.get('title','?')} ({r.get('source','?')})" for r in results
             ) or "（なし）"
             try:
-                check: CoverageCheck = coverage_llm.invoke([
+                return coverage_llm.invoke([
                     SystemMessage(COVERAGE_CHECK_SYSTEM),
                     HumanMessage(
                         f"## 調査が必要な論点\n{issues_str}\n\n"
                         f"## 収集済みの法令・情報一覧\n{results_str}"
                     ),
                 ])
-                return check.uncovered
             except Exception:
-                return []
+                return None
 
-        uncovered = _run_coverage_check()
+        check = _run_coverage_check()
+        uncovered = check.uncovered if check else []
         if uncovered:
             emit(f"⚠️ 未カバーの論点が{len(uncovered)}件。全件を補完検索します...")
             _fill_start = len(results)
@@ -781,7 +786,7 @@ def search_node(state: AppState) -> dict:
                 else:
                     emit(f"🌐 [網羅性補完] Web検索:「{q}」")
                     web_results = search_web(q)
-                    entry, added = _process_web_results(web_results, q, seen_titles, results, "網羅性補完")
+                    entry, added = _process_web_results(web_results, q, seen_titles, results, "網羅性補完", suggestions_out=search_suggestions)
                 search_log.append(entry)
                 progress_messages.append(AIMessage(content=entry, name="search_progress"))
                 emit(entry)
@@ -793,7 +798,9 @@ def search_node(state: AppState) -> dict:
                 r["protected"] = True
 
             # 補完後に再チェックし、それでも未カバーの論点を記録する
-            uncovered_issues = [u.issue for u in _run_coverage_check()]
+            recheck = _run_coverage_check()
+            check = recheck or check
+            uncovered_issues = [u.issue for u in recheck.uncovered] if recheck else []
             if uncovered_issues:
                 warn = (
                     f"⚠️ 補完検索後も{len(uncovered_issues)}件の論点は対応情報が"
@@ -805,6 +812,15 @@ def search_node(state: AppState) -> dict:
                 emit("✅ 補完検索により全論点がカバーされました")
         else:
             emit("✅ 全論点に対応する情報が収集されています")
+
+        # 最終チェック結果からカバー元マップを構築（入力論点の原文表記のみ採用）
+        if check:
+            _issue_set = set(issues)
+            issue_coverage = {
+                c.issue: [t for t in c.covered_by if t][:3]
+                for c in check.covered
+                if c.issue in _issue_set and c.covered_by
+            }
 
     # ── 上限超過時の切り捨て ──
     # ソース別のバランスを保って割愛する。Web結果は条例・届出先・手続き情報の
@@ -870,6 +886,8 @@ def search_node(state: AppState) -> dict:
         "search_results":   results[:MAX_SEARCH_RESULTS],
         "executed_queries": sorted(executed_queries),
         "uncovered_issues": uncovered_issues,
+        "issue_coverage":   issue_coverage,
+        "search_suggestions": search_suggestions,
         "phase":            "synthesizing",
         "messages":         progress_messages,
     }
@@ -1033,9 +1051,35 @@ def _attach_delivery_sources(law_items: list, search_results: list) -> None:
             if r and r.get("url"):
                 d["authority_source_url"]   = r["url"]
                 d["authority_source_title"] = r.get("title", "")
+                # レポート生成時に Grounding 由来リンクを除外するための種別
+                # （Gemini API 追加利用規約: Grounding 結果のリンクは保存不可）
+                d["authority_source_kind"]  = r.get("source", "")
             else:
                 d["authority_source_url"]   = ""
                 d["authority_source_title"] = ""
+                d["authority_source_kind"]  = ""
+
+
+# ─── 法令名マッチング ─────────────────────────────────────────────
+# 本法と下位法令の取り違えを防ぐための接尾辞
+_SUBLAW_SUFFIXES = ("施行令", "施行規則", "施行細則")
+
+
+def _is_law_name_match(law_name: str, title: str) -> bool:
+    """法令名と e-Gov 検索結果タイトルが同一法令を指すか判定する。
+
+    完全一致のほか部分一致も許容するが、一方が他方＋「施行令」「施行規則」等の
+    下位法令名になっている組み合わせは別法令として除外する
+    （例：law_name「消防法」と title「消防法施行規則」は不一致）。
+    """
+    if not law_name or not title:
+        return False
+    if law_name == title:
+        return True
+    for a, b in ((law_name, title), (title, law_name)):
+        if b.startswith(a) and b[len(a):].startswith(_SUBLAW_SUFFIXES):
+            return False
+    return law_name in title or title in law_name
 
 
 # ─── ノード: 結果統合 ─────────────────────────────────────────────
@@ -1138,23 +1182,39 @@ def synthesis_node(state: AppState) -> dict:
             }
     for law in law_items:
         law_name = law.get("law_name", "")
-        for title, ids in title_to_ids.items():
-            if law_name in title or title in law_name:
-                law["law_id"]          = ids["law_id"]
-                law["law_revision_id"] = ids["law_revision_id"]
-                break
+        # 完全一致を最優先し、部分一致は候補の中から名称が最も近いものを選ぶ
+        # （単純な部分一致だと「消防法」が検索結果の並び順次第で「消防法施行規則」に
+        # 先にマッチし、本法の項目に施行規則の条文が表示される取り違えが起きたため）
+        ids = title_to_ids.get(law_name)
+        if ids is None:
+            candidates = [
+                (title, i) for title, i in title_to_ids.items()
+                if _is_law_name_match(law_name, title)
+            ]
+            if candidates:
+                _, ids = min(candidates, key=lambda c: abs(len(c[0]) - len(law_name)))
+        if ids:
+            law["law_id"]          = ids["law_id"]
+            law["law_revision_id"] = ids["law_revision_id"]
         else:
             law.setdefault("law_id", "")
             law.setdefault("law_revision_id", "")
 
     # law_id が未解決の法令だけ e-Gov API で補完検索
+    # （名称が一致するヒットのみ採用する。無条件に1件目を採用すると
+    # 別法令の law_id が付き、無関係な条文が表示されるため）
     for law in law_items:
         if not law.get("law_id"):
             law_name = law.get("law_name", "")
             if law_name:
-                hits = search_laws_by_keyword(law_name, max_results=1)
-                if hits:
-                    law["law_id"] = hits[0].get("law_id", "")
+                hits = search_laws_by_keyword(law_name, max_results=3)
+                hit = next(
+                    (h for h in hits if _is_law_name_match(law_name, h.get("title", ""))),
+                    None,
+                )
+                if hit:
+                    law["law_id"]          = hit.get("law_id", "")
+                    law["law_revision_id"] = hit.get("law_revision_id", "")
 
     # 条番号をe-Gov原文と照合して確定（LLM知識由来の条番号ハルシネーション防止）
     _ground_relevant_articles(law_items)
@@ -1187,6 +1247,7 @@ def results_review_node(state: AppState) -> dict:
         "excluded_laws":    state.get("excluded_laws", []),
         "uncovered_issues": state.get("uncovered_issues", []),
         "issues":           state.get("issues", []),   # 網羅性チェック表示用
+        "issue_coverage":   state.get("issue_coverage", {}),  # カバー元の法令表示用
     })
 
     # 「足りない・再調査して」依頼なら検索フェーズに戻す
@@ -1260,6 +1321,7 @@ def report_node(state: AppState) -> dict:
         uncovered_issues=state.get("uncovered_issues", []),
         summary=state.get("synthesis_summary", ""),
         issues=state.get("issues", []),
+        issue_coverage=state.get("issue_coverage", {}),
     )
 
     # Human in the loop: レポートレビュー

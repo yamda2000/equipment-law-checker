@@ -44,6 +44,7 @@ from backend.tools.internal_docs import (
 )
 from backend.case_memory import list_cases, delete_case
 from backend.tools.web_search import get_gemini_usage
+from backend.observability import trace_run, langfuse_enabled
 
 # ─────────────────────────────────────────
 # ページ設定
@@ -173,6 +174,14 @@ def to_ja_field_names(text: str) -> str:
     for en, ja in FIELD_NAME_JA.items():
         text = text.replace(en, f"「{ja}」")
     return text
+
+
+def _suggestion_html(html: str) -> str:
+    """Google 検索候補（searchEntryPoint）の HTML を iframe 表示用に補正する。
+    Google が返すリンクには target 属性がなく、components.html の iframe 内で
+    遷移しようとして Google 側の X-Frame-Options に拒否され「開かない」ため、
+    <base target="_blank"> で全リンクを新しいタブで開かせる。"""
+    return '<base target="_blank">' + html
 
 
 
@@ -343,11 +352,13 @@ def invoke_hearing(user_text: str):
 
     try:
         with st.spinner("情報整理・分析中..." if hearing_ending else "AIが考えています..."):
-            with get_openai_callback() as cb:
+            with get_openai_callback() as cb, trace_run(
+                "hearing", session_id=st.session_state.thread_id, input=user_text,
+            ) as lf:
                 try:
                     workflow.invoke(
                         {"messages": [HumanMessage(content=user_text)]},
-                        config=config,
+                        config={**config, **lf},
                     )
                 finally:
                     # エラー時も、そこまでに消費したトークンを計上する
@@ -402,9 +413,13 @@ def start_with_documents(files) -> bool:
                 failed.append(f.name)
         if doc_texts:
             try:
-                with get_openai_callback() as cb:
+                with get_openai_callback() as cb, trace_run(
+                    "doc_extraction",
+                    session_id=st.session_state.thread_id,
+                    input=[name for name, _t in doc_texts],
+                ) as lf:
                     try:
-                        extracted = extract_equipment_info(doc_texts)
+                        extracted = extract_equipment_info(doc_texts, config=lf)
                     finally:
                         _record_llm_usage(cb)
             except Exception:
@@ -558,10 +573,15 @@ def resume_graph(decision):
         # 調査フェーズは各ステップの進捗をライブ表示（stream_mode="custom"）
         status = st.status("🔎 AI調査を開始しています...", expanded=True)
         try:
-            with get_openai_callback() as cb:
+            with get_openai_callback() as cb, trace_run(
+                f"search:{current_phase or 'resume'}",
+                session_id=st.session_state.thread_id,
+                input=decision,
+            ) as lf:
                 try:
                     for chunk in workflow.stream(
-                        Command(resume=decision), config=config, stream_mode="custom"
+                        Command(resume=decision), config={**config, **lf},
+                        stream_mode="custom",
                     ):
                         entry = chunk.get("progress") if isinstance(chunk, dict) else None
                         if entry:
@@ -582,9 +602,13 @@ def resume_graph(decision):
     else:
         try:
             with st.spinner("処理中..."):
-                with get_openai_callback() as cb:
+                with get_openai_callback() as cb, trace_run(
+                    f"resume:{current_phase or 'resume'}",
+                    session_id=st.session_state.thread_id,
+                    input=decision,
+                ) as lf:
                     try:
-                        workflow.invoke(Command(resume=decision), config=config)
+                        workflow.invoke(Command(resume=decision), config={**config, **lf})
                     finally:
                         _record_llm_usage(cb)
         except Exception:
@@ -960,6 +984,7 @@ def render_results_detail(idata: dict):
     # 網羅性チェックの結果（論点ごとの✅/⚠️判定を明示。OKの場合もOKと表示する）
     issues_list = idata.get("issues") or []
     uncovered = idata.get("uncovered_issues") or []
+    issue_coverage = idata.get("issue_coverage") or {}
     covered_n = len([i for i in issues_list if i not in uncovered])
 
     if issues_list and not uncovered:
@@ -1007,9 +1032,15 @@ def render_results_detail(idata: dict):
                         unsafe_allow_html=True,
                     )
                 else:
+                    covered_by = issue_coverage.get(i) or []
+                    covered_by_html = (
+                        f'<div style="font-size:11px;color:#558B2F;margin:1px 0 4px 1.6em;">'
+                        f'└ カバー元：{html_lib.escape("、".join(covered_by))}</div>'
+                        if covered_by else ""
+                    )
                     st.markdown(
                         f'<div style="font-size:13px;color:#2E7D32;margin:3px 0;">'
-                        f'✅ {html_lib.escape(to_ja_field_names(i))}</div>',
+                        f'✅ {html_lib.escape(to_ja_field_names(i))}</div>{covered_by_html}',
                         unsafe_allow_html=True,
                     )
 
@@ -1316,6 +1347,27 @@ def render_results_detail(idata: dict):
                 )
             st.caption("※ 前提となる設備情報が変わった場合は再調査してください。")
 
+    # Google 検索の検索候補（searchEntryPoint）。
+    # Gemini API 追加利用規約により、Grounding の検索結果（出典リンク等）を
+    # 表示する際は検索候補もあわせて表示する必要がある。表示専用であり、
+    # レポート・ケースメモリには保存しない
+    suggestions = get_state_value(st.session_state.thread_id, "search_suggestions") or []
+    if suggestions:
+        st.markdown("**🔎 Google 検索候補**")
+        st.caption(
+            "Web検索（Google検索グラウンディング）に関連する Google の検索候補です。"
+            "クリックすると Google 検索の結果ページが新しいタブで開きます。"
+        )
+        # Gemini API 追加利用規約により、検索候補の表示は最大5件までとする
+        for s in suggestions[:5]:
+            if s.get("html"):
+                components.html(_suggestion_html(s["html"]), height=72, scrolling=True)
+        if len(suggestions) > 5:
+            st.caption(
+                f"※ 検索候補は Gemini API 利用規約に基づき最大5件まで表示しています"
+                f"（他 {len(suggestions) - 5}件は非表示）。"
+            )
+
 
 def render_results_review(idata: dict):
     # 調査方針の内容・調査結果の詳細は、それぞれ「3. 調査方針確認」「5. 調査結果確認」
@@ -1444,6 +1496,12 @@ def render_sidebar():
                         f"　${web['cost']:.3f}"
                     )
                 st.caption("※ 埋め込み（社内文書登録・検索）のコストは含みません。")
+                if langfuse_enabled():
+                    lf_host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+                    st.caption(
+                        f"※ 表示は概算です。正確なコスト・リクエスト内容のトレースは "
+                        f"[Langfuse]({lf_host}) で確認できます。"
+                    )
             st.divider()
 
         st.markdown("## ⚖️ ステップ")

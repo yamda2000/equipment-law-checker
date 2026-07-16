@@ -9,7 +9,7 @@ import urllib.parse
 
 from backend.tools.egov import (
     fetch_article_text, fetch_article_captions, fetch_article_chapters,
-    article_sort_key,
+    article_sort_key, get_suggested_keywords,
 )
 
 
@@ -56,6 +56,7 @@ def generate_html_report(
     uncovered_issues: list = None,
     summary: str = "",
     issues: list = None,
+    issue_coverage: dict = None,
 ) -> str:
     """法令別アクションアイテムから HTML レポートを生成する"""
     now = datetime.now()
@@ -75,8 +76,10 @@ def generate_html_report(
     law_html       = _build_law_items(law_items)
     unknown_html   = _build_unknown_items(unknown_items)
     law_refs       = _build_law_refs(search_results)
-    uncovered_html = _build_coverage_check(issues or [], uncovered_issues or [])
-    excluded_html  = _build_excluded_laws(excluded_laws or [])
+    uncovered_html = _build_coverage_check(
+        issues or [], uncovered_issues or [], issue_coverage or {}
+    )
+    matrix_html    = _build_law_matrix(law_items, excluded_laws or [], equipment_info)
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -162,10 +165,10 @@ def generate_html_report(
 
 {uncovered_html}
 
+{matrix_html}
+
 <h2>⚖️ 法令別 届出・対応事項</h2>
 {law_html}
-
-{excluded_html}
 
 {f'<h2>⚠️ 不明・未定情報（追加確認タスク）</h2>{unknown_html}' if unknown_items else ''}
 
@@ -546,9 +549,16 @@ def _build_law_items(law_items: list) -> str:
             )
             basis = d.get("authority_basis", "")
             src_url = d.get("authority_source_url", "")
+            src_title = d.get("authority_source_title") or "出典ページ"
+            # Google検索グラウンディング由来のリンク・タイトルは、Gemini API
+            # 追加利用規約により保存が制限されるため、恒久保存されるレポートには
+            # 掲載しない（結果確認画面では表示される）
+            if d.get("authority_source_kind", "") == "Gemini Grounding":
+                src_url = ""
+                src_title = ""
             src_link = (
                 f'　<a href="{_esc(src_url)}" target="_blank" style="color:#1565C0;">🔗 '
-                f'{_esc((d.get("authority_source_title") or "出典ページ")[:40])}</a>'
+                f'{_esc(src_title[:40])}</a>'
                 if src_url else ""
             )
             basis_html = (
@@ -589,11 +599,13 @@ def _build_law_items(law_items: list) -> str:
     return html
 
 
-def _build_coverage_check(issues: list, uncovered: list) -> str:
+def _build_coverage_check(issues: list, uncovered: list, coverage: dict = None) -> str:
     """網羅性チェックの結果。論点ごとの✅/⚠️判定を明示し、
-    OKの場合も「チェックしてOKだった」ことが分かるように表示する。"""
+    OKの場合も「チェックしてOKだった」ことが分かるように表示する。
+    coverage は {論点: [カバー元の法令・情報タイトル, ...]}（カバー判定の検証用）。"""
     if not issues and not uncovered:
         return ""
+    coverage = coverage or {}
 
     covered_n = len([i for i in issues if i not in uncovered])
 
@@ -635,9 +647,17 @@ def _build_coverage_check(issues: list, uncovered: list) -> str:
                 f'<td>{_to_ja_fields(_esc(i))}　<span style="color:#B71C1C;">（手動確認を推奨）</span></td></tr>'
             )
         else:
+            covered_by = coverage.get(i) or []
+            covered_by_html = (
+                f'<div style="font-size:11px;color:#2E7D32;margin-top:3px;">'
+                f'└ カバー元：{_esc("、".join(covered_by))}</div>'
+                if covered_by else
+                '<div style="font-size:11px;color:#888;margin-top:3px;">'
+                '└ カバー元：記録なし（カバー判定の根拠は収集結果一覧を参照）</div>'
+            )
             detail_rows += (
                 f'<tr><td style="white-space:nowrap;color:#2E7D32;font-weight:700;">✅ カバー済み</td>'
-                f'<td>{_to_ja_fields(_esc(i))}</td></tr>'
+                f'<td>{_to_ja_fields(_esc(i))}{covered_by_html}</td></tr>'
             )
     detail_table = (
         f'<details style="margin-top:8px;">'
@@ -659,24 +679,126 @@ def _build_coverage_check(issues: list, uncovered: list) -> str:
     )
 
 
-def _build_excluded_laws(items: list) -> str:
-    """確認したうえで非該当と判断した法令の一覧。判断根拠のレビューを可能にする。"""
-    if not items:
+def _build_law_matrix(law_items: list, excluded_laws: list, equipment_info: dict) -> str:
+    """法令確認の全体像（確認漏れチェック用・常設表示）。
+
+    1. ルールベース必須法令との突合：設備属性から機械的に導出した必須確認法令
+       （AIの判断を介さない決定的リスト）が、最終的な法令リスト（該当・要確認・
+       非該当）に反映されているかを突き合わせる。AIの論点出しに漏れがあっても
+       ここで検出できる。
+    2. 確認済み法令の全件一覧：該当・要確認・非該当を1つの表で示す。
+       非該当が0件でもセクションを表示し、「どこまで確認したか」を常に明示する。
+    """
+    listed   = [(l.get("law_name", ""), l) for l in law_items if l.get("law_name")]
+    excluded = [(e.get("law_name", ""), e) for e in excluded_laws if e.get("law_name")]
+
+    # ── 1. ルールベース必須法令との突合 ──
+    baseline = get_suggested_keywords(equipment_info or {})
+
+    def _area_hit(base: str, names: list) -> str:
+        """法令領域の照合（緩い部分一致）。施行令・施行規則が載っていれば
+        その領域は確認済みとみなす。マッチした法令名を返す。"""
+        for name, _item in names:
+            if base and name and (base in name or name in base):
+                return name
         return ""
-    rows = "".join(
-        f'<tr><td style="white-space:nowrap;font-weight:600;">{_esc(e.get("law_name", ""))}</td>'
-        f'<td>{_to_ja_fields(_esc(e.get("reason", "")))}</td></tr>'
-        for e in items
+
+    missing: list[str] = []
+    base_rows = ""
+    for base in baseline:
+        hit = _area_hit(base, listed)
+        if hit:
+            status = '<span style="color:#2E7D32;font-weight:700;">✅ 掲載</span>'
+            note = f'法令リストに掲載（{_esc(hit)}）'
+        else:
+            hit = _area_hit(base, excluded)
+            if hit:
+                status = '<span style="color:#555;font-weight:700;">🚫 非該当</span>'
+                note = f'確認のうえ非該当と判断（{_esc(hit)}）'
+            else:
+                missing.append(base)
+                status = '<span style="color:#B71C1C;font-weight:700;">⚠️ 未掲載</span>'
+                note = ('<span style="color:#B71C1C;">最終リストに見当たりません。'
+                        '適用要否を手動で確認してください</span>')
+        base_rows += (
+            f'<tr><td style="white-space:nowrap;font-weight:600;">{_esc(base)}</td>'
+            f'<td style="white-space:nowrap;">{status}</td><td>{note}</td></tr>'
+        )
+
+    if missing:
+        base_summary = (
+            f'<div style="background:#FFEBEE;border:1px solid #EF9A9A;border-left:5px solid #C62828;'
+            f'border-radius:6px;padding:12px 18px;font-size:13px;margin-bottom:8px;">'
+            f'<strong>🚨 突合結果 NG：</strong>設備属性から機械的に導出した必須確認法令 '
+            f'{len(baseline)}件のうち、<strong>{len(missing)}件（{_esc("、".join(missing))}）が'
+            f'最終リストに見当たりません。</strong>確認漏れの可能性があるため、適用要否を手動で確認してください。</div>'
+        )
+    else:
+        base_summary = (
+            f'<div style="background:#E8F5E9;border:1px solid #A5D6A7;border-left:5px solid #2E7D32;'
+            f'border-radius:6px;padding:12px 18px;font-size:13px;color:#1B5E20;margin-bottom:8px;">'
+            f'<strong>✅ 突合結果 OK：</strong>設備属性から機械的に導出した必須確認法令 '
+            f'{len(baseline)}件は、すべて最終リスト（該当・要確認・非該当のいずれか）に反映されています。</div>'
+        )
+
+    base_table = (
+        f'<details style="margin-bottom:16px;">'
+        f'<summary style="cursor:pointer;font-size:12px;color:#1565C0;font-weight:700;">'
+        f'🧾 必須確認法令との突合結果を表示（全{len(baseline)}件）</summary>'
+        f'<table class="info-table" style="margin-top:8px;">'
+        f'<tr><td style="width:32%;">必須確認法令（ルールベース）</td>'
+        f'<td style="width:12%;">判定</td><td>反映先</td></tr>{base_rows}</table>'
+        f'</details>'
     )
+
+    # ── 2. 確認済み法令の全件一覧（該当・要確認・非該当） ──
+    matrix_rows = ""
+    _prio_rank = {"required": 0, "check": 1}
+    for name, law in sorted(listed, key=lambda x: _prio_rank.get(x[1].get("priority", "check"), 1)):
+        p = law.get("priority", "check")
+        cfg = PRIORITY_CONFIG.get(p, PRIORITY_CONFIG["check"])
+        n_del = len([d for d in law.get("deliveries", []) if d.get("item")])
+        n_act = len([a for a in law.get("internal_actions", []) if a.get("item")])
+        detail = "　".join(
+            s for s in (
+                f"届出・申請 {n_del}件" if n_del else "",
+                f"社内対応 {n_act}件" if n_act else "",
+            ) if s
+        ) or "対応事項なし（適用要否の確認のみ）"
+        matrix_rows += (
+            f'<tr><td style="white-space:nowrap;font-weight:600;">{_esc(name)}</td>'
+            f'<td style="white-space:nowrap;"><span class="badge badge-{p}">{cfg["label"]}</span></td>'
+            f'<td>{detail}</td></tr>'
+        )
+    for name, e in excluded:
+        matrix_rows += (
+            f'<tr style="background:#FAFAFA;color:#555;">'
+            f'<td style="white-space:nowrap;font-weight:600;">{_esc(name)}</td>'
+            f'<td style="white-space:nowrap;">🚫 非該当</td>'
+            f'<td>{_to_ja_fields(_esc(e.get("reason", "")))}</td></tr>'
+        )
+
+    excluded_note = "" if excluded else (
+        '<div style="font-size:12px;color:#666;margin-top:6px;">'
+        '※ 今回「非該当」と断定した法令はありません。判断材料が不足している法令は'
+        '非該当とせず「要確認」に含めています（安全側の運用）。</div>'
+    )
+
     return (
-        f'<h2>🚫 確認のうえ非該当と判断した法令</h2>'
+        f'<h2>🧾 法令確認の全体像（確認漏れチェック）</h2>'
         f'<div style="font-size:12px;color:#666;margin-bottom:8px;">'
-        f'以下は調査対象としたうえで「適用なし」と判断した法令です。'
-        f'判断理由（根拠となる設備情報）に誤りがないかご確認ください。'
+        f'確認漏れがないことを検証するためのセクションです。上段は設備属性から'
+        f'機械的に導出した必須確認法令（AIの判断を介さない決定的リスト）との突合結果、'
+        f'下段は該当・要確認・非該当を含む確認済み法令の全件一覧です。'
+        f'非該当の判断理由に誤りがないかもご確認ください。'
         f'前提となる設備情報が変わった場合は再調査が必要です。</div>'
+        f'{base_summary}'
+        f'{base_table}'
         f'<table class="info-table">'
-        f'<tr><td style="width:30%;">法令名</td><td>非該当と判断した理由</td></tr>{rows}'
+        f'<tr><td style="width:32%;">法令名</td><td style="width:14%;">判定</td>'
+        f'<td>対応事項／非該当の理由</td></tr>{matrix_rows}'
         f'</table>'
+        f'{excluded_note}'
     )
 
 
@@ -690,7 +812,17 @@ def _build_unknown_items(items: list) -> str:
 
 def _build_law_refs(search_results: list) -> str:
     refs = [r for r in search_results if r.get("title") and "error" not in r.get("source", "")]
-    if not refs:
+    # Google検索グラウンディングの検索結果（タイトル・リンク・サマリー）は
+    # Gemini API 追加利用規約により保存が制限されるため、恒久保存される
+    # レポートには掲載せず、件数のみ注記する（結果確認画面では表示される）
+    _grounding_sources = ("Gemini Grounding", "Gemini Summary")
+    n_web = sum(1 for r in refs if r.get("source") in _grounding_sources)
+    refs = [r for r in refs if r.get("source") not in _grounding_sources]
+    # 社内文書はチャンク（抜粋）単位のヒットをファイル単位に集約する
+    # （同一文書の抜粋が何行も並ぶ・関連の薄い文書が目立つのを防ぐ）
+    internal = [r for r in refs if r.get("source") == "社内文書"]
+    refs     = [r for r in refs if r.get("source") != "社内文書"]
+    if not refs and not internal and not n_web:
         return ""
     html = ""
     for r in refs:
@@ -699,4 +831,26 @@ def _build_law_refs(search_results: list) -> str:
         source = _esc(r.get("source", ""))
         link = f'<a href="{_esc(url)}" target="_blank">{title}</a>' if url else title
         html += f'<div class="law-ref">📖 {link} <span style="color:#888">({source})</span></div>'
+    if internal:
+        by_file: dict = {}
+        for r in internal:
+            m = re.match(r"社内文書:\s*(.+?)（抜粋", r.get("title", ""))
+            fname = m.group(1).strip() if m else r.get("title", "")
+            by_file[fname] = by_file.get(fname, 0) + 1
+        for fname, n in by_file.items():
+            html += (
+                f'<div class="law-ref">📁 {_esc(fname)} '
+                f'<span style="color:#888">(社内文書・ヒット抜粋 {n}件)</span></div>'
+            )
+        html += (
+            '<div class="law-ref" style="color:#888;">'
+            '※ 社内文書はベクトル検索でヒットした文書の一覧です。'
+            '本件と関連の薄い文書が含まれる場合があります（採否はAIが判断済み）。</div>'
+        )
+    if n_web:
+        html += (
+            f'<div class="law-ref" style="color:#888;">🌐 このほか Web検索（Google検索）で '
+            f'{n_web}件の公開情報を参照しました。検索結果のリンクは Google の利用規約により'
+            f'本レポートには掲載していません（調査時の結果確認画面で参照できます）。</div>'
+        )
     return html

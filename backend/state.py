@@ -30,8 +30,15 @@ class AppState(TypedDict):
     search_results: list
     # 実行済み検索クエリ（再調査ラウンドで同一クエリの再実行を防ぐ）
     executed_queries: list
+    # Google 検索の検索候補（searchEntryPoint の rendered_content）。
+    # Grounding 結果を表示する際にあわせて表示することが Gemini API
+    # 追加利用規約で求められる。表示専用（統合LLM・レポートには含めない）
+    search_suggestions: list
     # 網羅性検証で「対応情報が見つからない」と判定された論点（担当者に明示）
     uncovered_issues: list
+    # 網羅性検証のカバー元マップ {論点: [カバーする法令・情報タイトル, ...]}
+    # （カバー判定の妥当性を人が検証できるようレポート・結果確認に表示する）
+    issue_coverage: dict
 
     # 統合前にe-Govから取得した条文抜粋のキャッシュ
     # {"law_ids": [...], "excerpts": str}。再調査後の再統合で法令候補が
