@@ -200,6 +200,43 @@ class _WebSearchObservation:
             pass
 
 
+def get_session_cost(session_id: str) -> dict | None:
+    """Langfuse からセッション（案件＝thread_id）単位の実測コストを取得する。
+
+    アプリ側では概算せず、Langfuse が単価表から計算した totalCost を合算して
+    返す（サイドバー表示用）。戻り値: {"cost": float, "traces": int}。
+    無効・未設定・取得失敗時は None（呼び出し側で「取得できない」表示にする）。
+    """
+    if not langfuse_enabled() or not session_id:
+        return None
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        # 送信待ちのトレースを先に送る（直近の呼び出し分を反映させるため）
+        try:
+            client.flush()
+        except Exception:
+            pass
+        total = 0.0
+        traces = 0
+        page = 1
+        while page <= 10:   # 100件×10ページで打ち切り（1案件なら十分）
+            res = client.api.trace.list(session_id=session_id, page=page, limit=100)
+            data = getattr(res, "data", None) or []
+            for t in data:
+                total += float(getattr(t, "total_cost", 0) or 0)
+            traces += len(data)
+            meta = getattr(res, "meta", None)
+            if page >= int(getattr(meta, "total_pages", 1) or 1):
+                break
+            page += 1
+        return {"cost": total, "traces": traces}
+    except Exception:
+        logger.exception("Langfuse セッションコストの取得に失敗")
+        return None
+
+
 @contextmanager
 def observe_web_search(model: str, query: str):
     """Gemini Web検索1回を Langfuse の generation として記録する。

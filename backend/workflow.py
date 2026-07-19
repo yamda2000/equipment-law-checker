@@ -41,7 +41,7 @@ from backend.report_gen import generate_html_report
 
 
 # ─── LLM ファクトリ ───────────────────────────────────────────────
-def _llm(temperature: float = 0.0, max_tokens: int = 4096):
+def _llm(temperature: float = 1.0, max_tokens: int | None = None):
     """LLM_MODE に応じて OpenAI または Azure OpenAI を返す"""
     mode = os.getenv("LLM_MODE", "poc").lower()
 
@@ -221,6 +221,17 @@ def _merge_note(existing: str, extra: str) -> str:
     return f"{existing}\n{extra}".strip() if existing else extra
 
 
+def _split_attachments(extra: str) -> tuple:
+    """依頼文から添付資料の抜粋部分（UI側が「【添付資料「…」の内容抜粋】」形式で
+    連結する）を切り離す。抜粋は数千字になり得るため、チャット表示や論点リストには
+    依頼文だけを使い、全文は policy_note（調査プロンプト）にのみ渡す。
+    戻り値: (依頼文のみ, 添付有無)"""
+    i = extra.find("【添付資料「")
+    if i == -1:
+        return extra.strip(), False
+    return extra[:i].strip(), True
+
+
 # ─── ヒアリングツール定義（OpenAI/Azure 形式）────────────────────
 COMPLETE_HEARING_TOOL = {
     "type": "function",
@@ -376,7 +387,7 @@ def analysis_node(state: AppState) -> dict:
     if cases_str:
         n = cases_str.count("### 類似案件")
         updates["messages"] = [AIMessage(
-            f"🧠 ケースメモリから類似の過去案件 {n}件を参照して分析しました。"
+            f"📚 過去の調査事例から類似案件 {n}件を参照して分析しました。"
         )]
     return updates
 
@@ -404,7 +415,7 @@ def policy_review_node(state: AppState) -> dict:
                 break
 
     return {
-        "messages":    [AIMessage("調査方針が承認されました。e-Gov API で法令を調査します...")],
+        "messages":    [AIMessage("調査方針が承認されました。e-Gov API で法令を調査します。")],
         "policy_note": policy_note,
         "phase":       "searching",
     }
@@ -537,11 +548,26 @@ def search_node(state: AppState) -> dict:
         # 必須Web検索①: 横浜市・神奈川県の条例・届出施設
         emit("🌐 横浜市・神奈川県の条例・届出施設をWeb検索中...")
         equipment_type_str = equipment_info.get("equipment_type", "設備")
-        for local_query in [
+
+        def _field_needs_check(key: str) -> bool:
+            # 「あり」「不明」「未定」等は条例確認が必要。「なし」明記のみ除外する
+            v = str(equipment_info.get(key, "") or "").strip()
+            return bool(v) and not v.startswith("なし")
+
+        local_queries = [
             f"横浜市 {equipment_type_str} 届出施設 手続き 規制",
             f"横浜市 {equipment_type_str} 届出 条例 規制",
             f"神奈川県 {equipment_type_str} 届出 条例 規制",
-        ]:
+        ]
+        # 設備属性に応じて、条例名を明示した検索を追加する
+        # （一般語の「条例」検索より市・県の公式手続きページに当たりやすい）
+        if _field_needs_check("noise_vibration") or _field_needs_check("wastewater"):
+            local_queries.append(
+                f"横浜市生活環境の保全等に関する条例 指定事業所 特定施設 届出 {equipment_type_str}"
+            )
+        if _field_needs_check("chemicals") or _field_needs_check("fire_exhaust"):
+            local_queries.append("横浜市火災予防条例 少量危険物 届出 基準")
+        for local_query in local_queries:
             web_results = search_web(local_query)
             executed_queries.add(local_query)
             search_count += 1
@@ -904,7 +930,7 @@ def _ground_relevant_articles(law_items: list) -> None:
     """
     emit = _make_emit()
 
-    selector_llm = _llm(max_tokens=2000).with_structured_output(ArticleSelection)
+    selector_llm = _llm().with_structured_output(ArticleSelection)
 
     for law in law_items:
         law_name = law.get("law_name", "")
@@ -987,7 +1013,7 @@ def _prefetch_article_excerpts(
         if len(candidates) >= MAX_PREFETCH_LAWS:
             break
 
-    selector_llm = _llm(max_tokens=1000).with_structured_output(ArticleSelection)
+    selector_llm = _llm().with_structured_output(ArticleSelection)
     info_str = json.dumps(equipment_info, ensure_ascii=False, indent=2)
     issues_str = "\n".join(f"- {i}" for i in issues)
 
@@ -1089,7 +1115,7 @@ def synthesis_node(state: AppState) -> dict:
     interrupt を同一ノード内に置くと resume 時にノード全体（統合LLM＋
     条番号グラウンディング）が再実行され、確認した law_items とレポートに
     載る law_items がズレる・承認後の待ち時間とコストが倍になるため分離。"""
-    structured_llm = _llm(max_tokens=16000).with_structured_output(SynthesisResult)
+    structured_llm = _llm().with_structured_output(SynthesisResult)
     emit = _make_emit()
 
     equipment_info = state.get("equipment_info", {})
@@ -1253,10 +1279,14 @@ def results_review_node(state: AppState) -> dict:
     # 「足りない・再調査して」依頼なら検索フェーズに戻す
     if _is_reinvestigate(decision):
         extra = _extract_after(decision, _REINVEST_PREFIXES)
+        req_text, has_docs = _split_attachments(extra)
+        label = req_text or "添付資料の内容を踏まえた再調査"
+        if has_docs:
+            label += "（添付資料の内容は調査の参考情報として反映）"
         return {
-            "messages":    [AIMessage(f"担当者から追加調査の依頼を受けました：{extra}\n再調査を実施します...")],
+            "messages":    [AIMessage(f"担当者から追加調査の依頼を受けました：{label}\n再調査を実施します...")],
             "policy_note": _merge_note(state.get("policy_note", ""), extra),
-            "issues":      list(state.get("issues", []) or []) + [f"【追加調査依頼】{extra}"],
+            "issues":      list(state.get("issues", []) or []) + [f"【追加調査依頼】{req_text or label}"],
             "phase":       "searching",
         }
 
@@ -1265,7 +1295,7 @@ def results_review_node(state: AppState) -> dict:
         f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
     )
     return {
-        "messages": [AIMessage("レビュー完了。レポートを生成します...")],
+        "messages": [AIMessage("レビュー完了。レポートを生成します。")],
         "case_id":  case_id,
         "phase":    "reporting",
     }
@@ -1278,7 +1308,7 @@ def _refine_law_items(law_items: list, equipment_info: dict, instruction: str) -
     失敗時は元の law_items を返す。"""
     if not law_items:
         return law_items
-    refine_llm = _llm(max_tokens=16000).with_structured_output(RefineResult)
+    refine_llm = _llm().with_structured_output(RefineResult)
     ctx = (
         f"【設備情報】\n{json.dumps(equipment_info, ensure_ascii=False, indent=2)}\n\n"
         f"【現在の法令別対応事項(JSON)】\n{json.dumps(law_items, ensure_ascii=False, indent=2)}\n\n"
@@ -1334,10 +1364,14 @@ def report_node(state: AppState) -> dict:
     # ① 「足りない・再調査して」→ 検索フェーズに戻す
     if _is_reinvestigate(decision):
         extra = _extract_after(decision, _REINVEST_PREFIXES)
+        req_text, has_docs = _split_attachments(extra)
+        label = req_text or "添付資料の内容を踏まえた再調査"
+        if has_docs:
+            label += "（添付資料の内容は調査の参考情報として反映）"
         return {
-            "messages":    [AIMessage(f"レポート確認後、追加調査の依頼を受けました：{extra}\n再調査を実施します...")],
+            "messages":    [AIMessage(f"レポート確認後、追加調査の依頼を受けました：{label}\n再調査を実施します...")],
             "policy_note": _merge_note(state.get("policy_note", ""), extra),
-            "issues":      list(state.get("issues", []) or []) + [f"【追加調査依頼】{extra}"],
+            "issues":      list(state.get("issues", []) or []) + [f"【追加調査依頼】{req_text or label}"],
             "case_id":     case_id,
             "phase":       "searching",
         }
@@ -1350,8 +1384,11 @@ def report_node(state: AppState) -> dict:
         )
         # スキーマ往復で消えた出典URL・タイトルを authority_source_id から再解決
         _attach_delivery_sources(new_items, state.get("search_results", []))
+        refine_label, refine_docs = _split_attachments(refine)
+        if refine_docs:
+            refine_label += "（添付資料の内容を参照）"
         return {
-            "messages":  [AIMessage(f"レポート文面の修正依頼を受けました：{refine}\n修正して再生成します...")],
+            "messages":  [AIMessage(f"レポート文面の修正依頼を受けました：{refine_label}\n修正して再生成します...")],
             "law_items": new_items,
             "case_id":   case_id,
             "phase":     "reporting",
@@ -1365,12 +1402,11 @@ def report_node(state: AppState) -> dict:
             equipment_info=state.get("equipment_info", {}),
             law_items=state.get("law_items", []),
             excluded_laws=state.get("excluded_laws", []),
-            summary=state.get("synthesis_summary", ""),
         )
         if saved:
             memory_note = (
-                "\n\n🧠 この案件はケースメモリに保存されました。"
-                "次回以降、類似設備の案件で参照されます。"
+                "\n\n📚 この案件は「過去の調査事例」に保存されました。"
+                "次回以降、類似設備の案件でAIが自動で参考にします。"
             )
     except Exception:
         # 保存失敗で承認フローを止めない

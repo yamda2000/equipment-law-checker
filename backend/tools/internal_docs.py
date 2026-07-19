@@ -97,7 +97,7 @@ def _load_store():
                 allow_dangerous_deserialization=True,
             )
     else:
-        from langchain_community.vectorstores import Chroma
+        from langchain_chroma import Chroma
         _STORE = Chroma(
             collection_name="internal_docs",
             embedding_function=_embeddings(),

@@ -35,6 +35,11 @@ _LAW_ALIAS: dict[str, str] = {
 }
 
 
+def resolve_law_alias(name: str) -> str:
+    """通称・略称を正式法令名に解決する（未登録ならそのまま返す）。"""
+    return _LAW_ALIAS.get(name, name)
+
+
 def _extract_law_name_candidates(keyword: str) -> list[str]:
     """
     「大気汚染防止法 排気 届出」のような複合クエリから法令名候補を抽出する。

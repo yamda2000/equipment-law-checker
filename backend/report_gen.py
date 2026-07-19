@@ -9,7 +9,7 @@ import urllib.parse
 
 from backend.tools.egov import (
     fetch_article_text, fetch_article_captions, fetch_article_chapters,
-    article_sort_key, get_suggested_keywords,
+    article_sort_key, get_suggested_keywords, resolve_law_alias,
 )
 
 
@@ -45,6 +45,42 @@ def _esc(text) -> str:
     return html_lib.escape(str(text or ""))
 
 
+# 条例（e-Gov 未収載）の原文を確認できる公式例規集
+ORDINANCE_DB_LINKS = [
+    ("横浜市",   "横浜市例規集",   "https://cgi.city.yokohama.lg.jp/somu/reiki/reiki_menu.html"),
+    ("神奈川県", "神奈川県法規集", "https://www.pref.kanagawa.jp/docs/y8e/cnt/f7406/"),
+]
+
+# 頻出条例の本文直リンク。例規集システムの更新でURLが変わる可能性があるため、
+# 例規集トップへのリンクと併用する
+ORDINANCE_DIRECT_URLS = {
+    "横浜市生活環境の保全等に関する条例":
+        "https://cgi.city.yokohama.lg.jp/somu/reiki/reiki_honbun/g202RG00001294.html",
+    "横浜市火災予防条例":
+        "https://cgi.city.yokohama.lg.jp/somu/reiki/reiki_honbun/g202RG00001081.html",
+}
+
+
+def ordinance_links_html(law_name: str) -> str:
+    """e-Gov 未収載の条例向けに、公式例規集へのリンクHTMLを返す。
+    法令名から自治体を判別できない場合は横浜市・神奈川県の両方を出す。"""
+    links = []
+    direct = ORDINANCE_DIRECT_URLS.get(law_name)
+    if direct:
+        links.append(
+            f'<a href="{direct}" target="_blank" style="color:#1565C0;">'
+            f'🔗 例規集で条文を確認</a>'
+        )
+    dbs = [(label, url) for key, label, url in ORDINANCE_DB_LINKS if key in law_name]
+    if not dbs:
+        dbs = [(label, url) for _, label, url in ORDINANCE_DB_LINKS]
+    links += [
+        f'<a href="{url}" target="_blank" style="color:#1565C0;">📚 {label}</a>'
+        for label, url in dbs
+    ]
+    return "　".join(links)
+
+
 def generate_html_report(
     equipment_info: dict,
     law_items: list,
@@ -71,7 +107,8 @@ def generate_html_report(
 
     info_rows      = _build_info_rows(equipment_info)
     intro_html     = _build_intro(summary)
-    checklist_html = _build_action_checklist(law_items)
+    checklist_html = _build_action_checklist(
+        law_items, (equipment_info or {}).get("scheduled_date", ""))
     summary_html   = _build_summary(law_items)
     law_html       = _build_law_items(law_items)
     unknown_html   = _build_unknown_items(unknown_items)
@@ -136,8 +173,15 @@ def generate_html_report(
   .checklist td {{ border: 1px solid #e0e0e0; padding: 6px 8px; vertical-align: top; }}
   .checklist .cat td {{ background: #1565C0; color: white; font-weight: 700; font-size: 13px; }}
   .checklist .cb {{ text-align: center; width: 30px; font-size: 16px; color: #555; }}
+  .checklist .cb input {{ width: 16px; height: 16px; cursor: pointer; margin: 2px 0 0; }}
+  .checklist tr.done td {{ opacity: .55; }}
+  .checklist tr.done td:nth-child(2) {{ text-decoration: line-through; }}
+  .csv-btn {{ background: #1565C0; color: white; border: none; border-radius: 6px;
+              padding: 8px 14px; font-size: 13px; font-weight: 700; cursor: pointer; }}
+  .csv-btn:hover {{ background: #1976D2; }}
   @media print {{ body {{ padding: 0; background: white; }}
-                  .container {{ box-shadow: none; padding: 16px; }} }}
+                  .container {{ box-shadow: none; padding: 16px; }}
+                  .csv-btn {{ display: none; }} }}
 </style>
 </head>
 <body>
@@ -242,29 +286,117 @@ def _build_intro(summary: str) -> str:
 _TIMELINE_ORDER = ["設置・工事の前", "稼働開始の前", "稼働後・定期", "期限未確定（要確認）"]
 
 
-def _deadline_category(deadline: str) -> str:
-    """期限の文言を時系列カテゴリに分類する（キーワードベース）。"""
+def _parse_ym(text: str):
+    """「2025年4月1日」等から (年, 月) を取り出す。見つからなければ None。"""
+    m = re.search(r"(\d{4})年\s*(\d{1,2})月", str(text or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _deadline_category(deadline: str, sched_ym: tuple = None) -> str:
+    """期限の文言を時系列カテゴリに分類する。
+
+    判定順：
+    1. 工事・設置・発注など「設置前」を示す語（括弧内の補足を含む）
+    2. 稼働・使用開始などの「前」
+    3. 「稼働後」「設置後」等の主語つきの「後」・定期表現
+       （「機種確定後すみやかに」のような単独の「後」には反応させない）
+    4. 具体的な日付 → 稼働開始予定（sched_ym）と年月で比較して前後を判定
+    どれにも当たらないものだけを「期限未確定」とする。
+    """
     d = str(deadline or "")
-    if ("工事" in d and "前" in d) or ("設置" in d and "前" in d) or "着工" in d:
+    if ("工事" in d and "前" in d) or ("設置" in d and "前" in d) or "着工" in d \
+            or "発注前" in d or "施工計画" in d or "調達前" in d or "契約前" in d:
         return "設置・工事の前"
-    if (("稼働" in d or "使用開始" in d or "運転開始" in d) and "前" in d) \
+    if (("稼働" in d or "使用開始" in d or "運転開始" in d or "消費開始" in d) and "前" in d) \
             or re.search(r"(ヶ月|か月|カ月|日)前", d):
         return "稼働開始の前"
-    if "後" in d or "毎年" in d or "定期" in d or "年度" in d or "以内" in d:
+    if re.search(r"(稼働|設置|使用開始|運転開始|導入|工事完了|竣工)後", d) \
+            or "毎年" in d or "定期" in d or "年度" in d or "以内" in d:
         return "稼働後・定期"
+    ym = _parse_ym(d)
+    if ym:
+        if sched_ym:
+            return "稼働開始の前" if ym <= sched_ym else "稼働後・定期"
+        # 稼働開始予定が不明でも、期日が書けている以上「期限未確定」ではない。
+        # この種の期限はほぼ導入準備タスクのため「稼働開始の前」に寄せる。
+        return "稼働開始の前"
     return "期限未確定（要確認）"
 
 
-def _build_action_checklist(law_items: list) -> str:
+# チェックリストの完了状態保存（localStorage・端末ごと）と CSV エクスポート。
+# レポートは単体のHTMLファイルとして配布されるため、外部ライブラリに依存しない。
+_CHECKLIST_SCRIPT = """<script>
+(function () {
+  var table = document.getElementById('action-checklist');
+  if (!table) return;
+  var storeKey = 'lawcheck-checklist:' + document.title;
+  var state = {};
+  try { state = JSON.parse(localStorage.getItem(storeKey) || '{}'); } catch (e) {}
+
+  var category = '';
+  var items = [];
+  table.querySelectorAll('tr').forEach(function (tr) {
+    if (tr.classList.contains('cat')) {
+      category = tr.textContent.replace(/^▼\\s*/, '').replace(/（\\d+件）$/, '').trim();
+      return;
+    }
+    var box = tr.querySelector('input.cl-check');
+    if (!box) return;
+    var cells = tr.querySelectorAll('td');
+    // 行番号ではなく「時期＋対応事項」をキーにする（再生成後も同じ項目なら状態を引き継ぐ）
+    var key = category + '|' + cells[1].textContent.trim();
+    var apply = function () { tr.classList.toggle('done', box.checked); };
+    box.checked = !!state[key];
+    apply();
+    box.addEventListener('change', function () {
+      state[key] = box.checked;
+      apply();
+      try { localStorage.setItem(storeKey, JSON.stringify(state)); } catch (e) {}
+    });
+    items.push({ cells: cells, box: box, category: category });
+  });
+
+  var btn = document.getElementById('cl-csv-btn');
+  if (btn) btn.addEventListener('click', function () {
+    var esc = function (v) { return '"' + String(v || '').replace(/"/g, '""') + '"'; };
+    var lines = [['状態', '時期', '対応事項', '種別', '届出先・担当', '期限', '根拠法令'].map(esc).join(',')];
+    items.forEach(function (it) {
+      var c = it.cells;
+      lines.push([
+        it.box.checked ? '済' : '未',
+        it.category,
+        c[1].textContent.trim(),
+        c[2].textContent.trim(),
+        c[3].textContent.trim(),
+        c[4].textContent.trim(),
+        c[5].textContent.trim(),
+      ].map(esc).join(','));
+    });
+    // BOM付きUTF-8（Excelでの文字化け防止）
+    var blob = new Blob(['\\ufeff' + lines.join('\\r\\n')], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (document.title || '法令確認レポート') + '_チェックリスト.csv';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  });
+})();
+</script>"""
+
+
+def _build_action_checklist(law_items: list, scheduled_date: str = "") -> str:
     """全法令の届出・社内対応を期限の時系列で1つの表に統合する。
-    「結局、何を・いつまでに・どこへ」に一目で答えるための一覧。"""
+    「結局、何を・いつまでに・どこへ」に一目で答えるための一覧。
+    scheduled_date（稼働開始予定）は日付だけの期限を前後に振り分ける基準に使う。"""
+    sched_ym = _parse_ym(scheduled_date)
     rows_by_cat: dict = {c: [] for c in _TIMELINE_ORDER}
     for law in law_items:
         law_name = law.get("law_name", "")
         for d in law.get("deliveries", []):
             if not d.get("item"):
                 continue
-            rows_by_cat[_deadline_category(d.get("deadline", ""))].append({
+            rows_by_cat[_deadline_category(d.get("deadline", ""), sched_ym)].append({
                 "kind": "🏛️ 届出",
                 "item": d.get("item", ""),
                 "to": d.get("authority", ""),
@@ -275,7 +407,7 @@ def _build_action_checklist(law_items: list) -> str:
         for a in law.get("internal_actions", []):
             if not a.get("item"):
                 continue
-            rows_by_cat[_deadline_category(a.get("deadline", ""))].append({
+            rows_by_cat[_deadline_category(a.get("deadline", ""), sched_ym)].append({
                 "kind": "🏢 社内",
                 "item": a.get("item", ""),
                 "to": a.get("responsible", ""),
@@ -307,7 +439,7 @@ def _build_action_checklist(law_items: list) -> str:
                 prio_html = ""
             body += (
                 f'<tr>'
-                f'<td class="cb">☐</td>'
+                f'<td class="cb"><input type="checkbox" class="cl-check" aria-label="この項目を完了にする"></td>'
                 f'<td>{prio_html}{_esc(r["item"])}</td>'
                 f'<td style="white-space:nowrap;">{r["kind"]}</td>'
                 f'<td>{_esc(r["to"])}</td>'
@@ -320,11 +452,17 @@ def _build_action_checklist(law_items: list) -> str:
         f'<h2>✅ 対応チェックリスト（時系列）</h2>'
         f'<div style="font-size:12px;color:#666;margin-bottom:8px;">'
         f'すべての法令の届出・社内対応を期限順にまとめた一覧です（全{total}件）。'
-        f'印刷してチェック欄としてお使いください。詳細・根拠条文は下の「法令別 届出・対応事項」にあります。</div>'
-        f'<table class="checklist">'
+        f'チェック欄はブラウザ上でそのまま使え、状態はこの端末のブラウザに自動保存されます'
+        f'（別の端末・ブラウザには引き継がれません）。Excel等で管理する場合はCSV保存を、'
+        f'紙で使う場合は印刷をご利用ください。詳細・根拠条文は下の「法令別 届出・対応事項」にあります。</div>'
+        f'<div style="margin-bottom:8px;">'
+        f'<button id="cl-csv-btn" type="button" class="csv-btn">⬇️ チェックリストをCSVで保存（Excel対応）</button>'
+        f'</div>'
+        f'<table class="checklist" id="action-checklist">'
         f'<tr><th></th><th>対応事項</th><th>種別</th><th>届出先・担当</th><th>期限</th><th>根拠法令</th></tr>'
         f'{body}'
         f'</table>'
+        f'{_CHECKLIST_SCRIPT}'
     )
 
 
@@ -423,7 +561,7 @@ def _build_article_block(law: dict) -> str:
                 '<span style="color:#888;">条番号確認中'
                 '<span style="font-size:11px;">'
                 '（横浜市・神奈川県の条例は e-Gov 未収載のため、原文照合による'
-                '条番号の自動特定ができません。横浜市例規集・神奈川県例規集で'
+                '条番号の自動特定ができません。下の例規集リンクから'
                 '直接ご確認ください）'
                 '</span></span>'
             )
@@ -508,9 +646,10 @@ def _build_article_block(law: dict) -> str:
             )
         elif is_ordinance:
             article_box = (
-                '<div style="margin:8px 0;font-size:12px;color:#888;">'
-                '📚 条例の原文は「横浜市例規集」「神奈川県例規集」で検索して'
-                'ご確認ください（e-Gov 未収載）</div>'
+                f'<div style="margin:8px 0;font-size:12px;">'
+                f'{ordinance_links_html(law_name)}'
+                f'<span style="color:#888;">　（e-Gov 未収載のため公式例規集で原文をご確認ください）</span>'
+                f'</div>'
             )
         else:
             article_box = (
@@ -593,7 +732,7 @@ def _build_law_items(law_items: list) -> str:
   </div>
   <div class="law-applicability">📌 {_esc(law.get('applicability', ''))}</div>
   {article_block}
-  {'<div class="section-label">📋 届出・申請事項</div>' + deliveries_html if deliveries_html else '<div class="section-label" style="color:#888">📋 届出・申請事項なし（要確認）</div>'}
+  {'<div class="section-label">📋 届出・申請事項</div>' + deliveries_html if deliveries_html else '<div class="section-label" style="color:#888">📋 届出・申請事項：未特定（「届出不要」の意味ではありません。適用が確定した場合は再調査で特定できます）</div>'}
   {'<div class="section-label">🏢 社内対応事項</div>' + internal_html if internal_html else ''}
 </div>"""
     return html
@@ -696,10 +835,12 @@ def _build_law_matrix(law_items: list, excluded_laws: list, equipment_info: dict
     baseline = get_suggested_keywords(equipment_info or {})
 
     def _area_hit(base: str, names: list) -> str:
-        """法令領域の照合（緩い部分一致）。施行令・施行規則が載っていれば
+        """法令領域の照合（緩い部分一致）。通称・略称（フロン排出抑制法等）は
+        正式法令名に解決してから照合する。施行令・施行規則が載っていれば
         その領域は確認済みとみなす。マッチした法令名を返す。"""
+        candidates = {c for c in (base, resolve_law_alias(base)) if c}
         for name, _item in names:
-            if base and name and (base in name or name in base):
+            if name and any(c in name or name in c for c in candidates):
                 return name
         return ""
 
@@ -721,7 +862,7 @@ def _build_law_matrix(law_items: list, excluded_laws: list, equipment_info: dict
                 note = ('<span style="color:#B71C1C;">最終リストに見当たりません。'
                         '適用要否を手動で確認してください</span>')
         base_rows += (
-            f'<tr><td style="white-space:nowrap;font-weight:600;">{_esc(base)}</td>'
+            f'<tr><td style="font-weight:600;">{_esc(base)}</td>'
             f'<td style="white-space:nowrap;">{status}</td><td>{note}</td></tr>'
         )
 
@@ -766,14 +907,14 @@ def _build_law_matrix(law_items: list, excluded_laws: list, equipment_info: dict
             ) if s
         ) or "対応事項なし（適用要否の確認のみ）"
         matrix_rows += (
-            f'<tr><td style="white-space:nowrap;font-weight:600;">{_esc(name)}</td>'
+            f'<tr><td style="font-weight:600;">{_esc(name)}</td>'
             f'<td style="white-space:nowrap;"><span class="badge badge-{p}">{cfg["label"]}</span></td>'
             f'<td>{detail}</td></tr>'
         )
     for name, e in excluded:
         matrix_rows += (
             f'<tr style="background:#FAFAFA;color:#555;">'
-            f'<td style="white-space:nowrap;font-weight:600;">{_esc(name)}</td>'
+            f'<td style="font-weight:600;">{_esc(name)}</td>'
             f'<td style="white-space:nowrap;">🚫 非該当</td>'
             f'<td>{_to_ja_fields(_esc(e.get("reason", "")))}</td></tr>'
         )

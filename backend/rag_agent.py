@@ -76,7 +76,7 @@ def agentic_internal_search(
 
     # ① クエリ展開（失敗しても質問そのものをクエリにして続行する）
     try:
-        query_llm = _llm(max_tokens=1000).with_structured_output(RagQueries)
+        query_llm = _llm().with_structured_output(RagQueries)
         plan: RagQueries = query_llm.invoke([
             SystemMessage(RAG_QUERY_SYSTEM),
             HumanMessage(f"## 調べたいこと\n{question}{hint}"),
@@ -88,7 +88,7 @@ def agentic_internal_search(
     if not queries:
         queries = [question]
 
-    grade_llm = _llm(max_tokens=2000).with_structured_output(RagAssessment)
+    grade_llm = _llm().with_structured_output(RagAssessment)
     collected: dict[str, dict] = {}   # id -> チャンク
     relevant_ids: set[str] = set()
     executed: set[str] = set()

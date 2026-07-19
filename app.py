@@ -1,11 +1,12 @@
 """
-設備導入時 法令確認・届出施設確認AI
+設備導入時 法令・届出施設確認サポートAI
 メインアプリ - Streamlit UI
 """
 
 import os
 import re
 import html as html_lib
+import time
 import uuid
 import sys
 import logging
@@ -23,8 +24,12 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from langchain_community.callbacks import get_openai_callback
+from langchain_core.callbacks import UsageMetadataCallbackHandler
+from langchain_core.tracers.context import register_configure_hook
 from langgraph.types import Command
 
 from backend.workflow import (
@@ -43,14 +48,20 @@ from backend.tools.internal_docs import (
     delete_all as delete_all_internal_docs,
 )
 from backend.case_memory import list_cases, delete_case
+from backend.report_gen import ordinance_links_html
 from backend.tools.web_search import get_gemini_usage
-from backend.observability import trace_run, langfuse_enabled
+from backend.observability import trace_run, langfuse_enabled, get_session_cost
+from backend.qa import (
+    answer_question, generate_document,
+    build_context as build_qa_context, build_history as build_qa_history,
+)
+from backend.doc_export import build_file as build_doc_file
 
 # ─────────────────────────────────────────
 # ページ設定
 # ─────────────────────────────────────────
 st.set_page_config(
-    page_title="法令確認・届出施設確認AI",
+    page_title="法令・届出施設確認サポートAI",
     page_icon="⚖️",
     layout="wide",
 )
@@ -96,10 +107,169 @@ section[data-testid="stSidebar"] > div { zoom: 0.8; }
     color: #0D47A1;
 }
 
+/* 右上固定の「AIに質問」フローティングパネル（全フェーズ共通のQA）。
+   決定ボタン（案件を進める操作）と物理的に離し、どの画面でも同じ位置に出す。
+   top はズーム(0.8)適用後にタイトル行の高さ（Streamlitヘッダー直下）に
+   揃うよう 90px（実効72px）とする */
+.st-key-qa_float {
+    position: fixed;
+    top: 90px;
+    right: 32px;
+    width: auto;
+    z-index: 1000;
+}
+.st-key-qa_float [data-testid="stPopover"] button {
+    background: #5E35B1;
+    color: white;
+    border: none;
+    border-radius: 32px;
+    padding: 16px 34px;
+    font-weight: 700;
+    box-shadow: 0 4px 14px rgba(0,0,0,.28);
+}
+/* ボタン文言は内側の p 要素に描画されるため、フォントサイズはそこに指定する
+   （全体ズーム0.8適用後で実効約17px） */
+.st-key-qa_float [data-testid="stPopover"] button p {
+    font-size: 21px !important;
+    font-weight: 700 !important;
+    color: white !important;
+}
+.st-key-qa_float [data-testid="stPopover"] button:hover {
+    background: #7E57C2;
+    color: white;
+}
+/* ポップオーバー本体は document.body 直下に描画されるため全体指定
+   （このアプリのポップオーバーはQAパネルのみ）。
+   ダーク背景＋白文字で、白基調の本文・フォームと一目で区別できるようにする */
+[data-testid="stPopoverBody"] {
+    /* 本体（.block-container）と同じ0.8ズームを適用して文字サイズを揃える。
+       幅はズーム後の見た目で画面の約2/3になるよう 83vw（0.8×83≒66vw）を指定 */
+    zoom: 0.8;
+    width: 83vw !important;
+    max-width: 83vw !important;
+    /* 高さ：従来の約2倍。中身が少なくても min-height で確保し、
+       Streamlit 既定の maxHeight:70vh の上限も引き上げる（ズーム後の見た目 ≒ 68vh） */
+    min-height: 85vh;
+    max-height: 110vh !important;
+    /* 上端をボタンから少し下げる（ズーム後の見た目 ≒ 58px） */
+    margin-top: 72px !important;
+    background: #241C3B !important;   /* 紫がかったダーク */
+    border: 2px solid #7E57C2 !important;
+    border-radius: 12px;
+    box-shadow: 0 10px 32px rgba(0,0,0,.45) !important;
+}
+/* BaseWeb Popover は Body の内側にもう1枚白背景のコンテナ（Inner）を持つため
+   透過させ、Body のダーク背景をパネル全面に効かせる */
+[data-testid="stPopoverBody"] > div,
+[data-testid="stPopoverBody"] [data-testid="stForm"] {
+    background: transparent !important;
+}
+/* フォームの枠線はダーク背景に馴染む淡い白に */
+[data-testid="stPopoverBody"] [data-testid="stForm"] {
+    border-color: rgba(255,255,255,.30) !important;
+}
+/* パネル内のテキストは白系に（見出し・説明・キャプションすべて） */
+[data-testid="stPopoverBody"] p,
+[data-testid="stPopoverBody"] strong,
+[data-testid="stPopoverBody"] span,
+[data-testid="stPopoverBody"] label {
+    color: #F3EFFA !important;
+}
+[data-testid="stPopoverBody"] [data-testid="stCaptionContainer"] p,
+[data-testid="stPopoverBody"] [data-testid="stCaptionContainer"] span {
+    color: #C5B8E3 !important;   /* 補足文はやや落とした薄紫 */
+}
+/* 入力欄は白のまま残し、ダーク背景の中で「書く場所」を浮き上がらせる */
+[data-testid="stPopoverBody"] textarea {
+    background: #ffffff !important;
+    color: #1a1a1a !important;
+}
+/* パネル内の最新Q&A表示（長い回答はボックス内でスクロール） */
+[data-testid="stPopoverBody"] .qa-panel-answer {
+    background: rgba(255,255,255,.08);
+    border: 1px solid rgba(255,255,255,.20);
+    border-left: 4px solid #B39DDB;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 4px 0 10px 0;
+    max-height: 640px;
+    overflow-y: auto;
+}
+/* 文字サイズは 0.8 ズーム適用下で本体の本文（16px）・補足（14px）と揃える */
+[data-testid="stPopoverBody"] .qa-panel-q {
+    color: #C5B8E3;
+    font-size: 14px;
+    margin-bottom: 6px;
+}
+[data-testid="stPopoverBody"] .qa-panel-a {
+    color: #F3EFFA;
+    font-size: 16px;
+    line-height: 1.7;
+}
+/* 質問履歴クリアボタン：ダーク紫背景で目立つアンバー色 */
+[data-testid="stPopoverBody"] .st-key-qa_clear button {
+    background: #FFC107;
+    border: none;
+    font-weight: 700;
+}
+[data-testid="stPopoverBody"] .st-key-qa_clear button:hover {
+    background: #FFD54F;
+}
+[data-testid="stPopoverBody"] .st-key-qa_clear button p {
+    color: #311B92 !important;
+    font-weight: 700 !important;
+    font-size: 13px !important;
+}
+/* 添付アップローダーもダーク背景に馴染ませる */
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] {
+    background: rgba(255,255,255,.08) !important;
+    border: 1px dashed rgba(255,255,255,.35) !important;
+    color: #F3EFFA !important;
+}
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] span,
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] small {
+    color: #C5B8E3 !important;
+}
+/* アップローダーの「Upload」ボタン：ダーク紫背景でも読める白ボタン。
+   パネル全体の白文字指定に負けないよう、中の文字・アイコンにも紫を明示する */
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] button {
+    background: #ffffff !important;
+    color: #5E35B1 !important;
+    border: 1px solid #B39DDB !important;
+    font-weight: 700 !important;
+}
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] button p,
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] button span,
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] button [data-testid="stIconMaterial"] {
+    color: #5E35B1 !important;
+    font-weight: 700 !important;
+}
+[data-testid="stPopoverBody"] [data-testid="stFileUploaderDropzone"] button:hover {
+    background: #EDE7F6 !important;
+    border-color: #9575CD !important;
+}
+
+/* 送信ボタンはダーク背景に映える明るめの紫 */
+[data-testid="stPopoverBody"] button[kind="primaryFormSubmit"],
+[data-testid="stPopoverBody"] button[kind="primary"] {
+    background: #7E57C2 !important;
+    border-color: #7E57C2 !important;
+    color: #ffffff !important;
+}
+[data-testid="stPopoverBody"] button[kind="primaryFormSubmit"]:hover,
+[data-testid="stPopoverBody"] button[kind="primary"]:hover {
+    background: #9575CD !important;
+    border-color: #9575CD !important;
+}
+
+/* QA（質問対応）のUIは右上の質問パネル内で完結する（メイン画面には表示しない） */
+
 .phase-banner {
     background: linear-gradient(135deg, #1565C0, #1976D2);
     color: white; padding: 10px 16px; border-radius: 8px;
     font-weight: 700; font-size: 14px; margin-bottom: 12px;
+    /* サイドバーのステップリンクで飛んだ際、固定ヘッダーに隠れないための余白 */
+    scroll-margin-top: 110px;
 }
 
 .search-log-bubble {
@@ -128,6 +298,12 @@ div[data-stale="true"] button { visibility: hidden !important; }
 
 /* メイン領域の下パディングを詰める（入力欄の下に広い空白ができるのを防ぐ） */
 .block-container { padding-bottom: 2rem !important; }
+
+/* タイトル（h1）まわりの余白を少し詰める：上はコンテナの上パディング、
+   下は h1 自体のパディングと直後の区切り線のマージンを縮める */
+.block-container { padding-top: 3.5rem !important; }
+[data-testid="stHeading"] h1 { padding-top: 0.4rem !important; padding-bottom: 1rem !important; }
+.block-container hr { margin-top: 1em; margin-bottom: 1.2em; }
 
 /* 入力欄の英語ヒント（Press Enter to submit form 等）を非表示 */
 div[data-testid="InputInstructions"] { display: none; }
@@ -272,30 +448,95 @@ def _save_phase_idata(idata: dict):
 # ─────────────────────────────────────────
 # LLM 使用量・コストの積算
 # ─────────────────────────────────────────
+class _LLMUsageCallback(UsageMetadataCallbackHandler):
+    """旧 langchain_community.get_openai_callback 互換のトークン・呼び出し回数集計。
+    （langchain-community の廃止に伴い langchain_core の使用量集計へ移行。
+    単価表は持たないため total_cost は常に 0 で、金額は環境変数の単価か
+    Langfuse で計算する）"""
+
+    def __init__(self):
+        super().__init__()
+        self.successful_requests = 0
+        self.total_cost = 0.0
+
+    def on_llm_end(self, response, **kwargs):
+        with self._lock:
+            self.successful_requests += 1
+        super().on_llm_end(response, **kwargs)
+
+    @property
+    def prompt_tokens(self) -> int:
+        return sum(u.get("input_tokens", 0) for u in self.usage_metadata.values())
+
+    @property
+    def completion_tokens(self) -> int:
+        return sum(u.get("output_tokens", 0) for u in self.usage_metadata.values())
+
+
+# コンテキスト変数への登録はモジュール読み込み時に1回だけ行う
+# （呼び出しごとに register するとフックが増え続けるため）
+_llm_usage_cb_var: ContextVar = ContextVar("llm_usage_callback", default=None)
+register_configure_hook(_llm_usage_cb_var, inheritable=True)
+
+
+@contextmanager
+def get_llm_usage_callback():
+    """このブロック内の全 LangChain/LangGraph LLM 呼び出しの使用量を集計する。"""
+    cb = _LLMUsageCallback()
+    token = _llm_usage_cb_var.set(cb)
+    try:
+        yield cb
+    finally:
+        _llm_usage_cb_var.reset(token)
+
+
 def _record_llm_usage(cb) -> None:
-    """get_openai_callback の計測結果を案件単位で積算する。
-    Azure等でモデル単価が取得できず cost=0 の場合は、環境変数の単価
-    （LLM_COST_INPUT_PER_1M / LLM_COST_OUTPUT_PER_1M、USD/100万トークン）で概算する。"""
+    """get_llm_usage_callback の計測結果を案件単位で積算する。
+
+    Langfuse 設定時はコスト計測を Langfuse に一本化するため、アプリ側の
+    概算積算は行わない（サイドバーのコスト表示も出ない）。
+
+    金額は「確かな単価があるとき」＝環境変数 LLM_COST_INPUT_PER_1M /
+    LLM_COST_OUTPUT_PER_1M（USD/100万トークン）が明示設定されている場合だけ
+    計上する。無い呼び出しは unpriced（単価不明）として件数のみ数え、金額には
+    含めない（誤った単価で「それらしい金額」を表示しない）。"""
+    if langfuse_enabled():
+        return
     cost = cb.total_cost
-    if not cost and (cb.prompt_tokens or cb.completion_tokens):
-        in_rate  = float(os.getenv("LLM_COST_INPUT_PER_1M",  "2.5"))
-        out_rate = float(os.getenv("LLM_COST_OUTPUT_PER_1M", "10.0"))
-        cost = cb.prompt_tokens / 1e6 * in_rate + cb.completion_tokens / 1e6 * out_rate
+    priced = cost > 0
+    if not priced and (cb.prompt_tokens or cb.completion_tokens):
+        in_rate  = os.getenv("LLM_COST_INPUT_PER_1M")
+        out_rate = os.getenv("LLM_COST_OUTPUT_PER_1M")
+        if in_rate and out_rate:
+            try:
+                cost = (cb.prompt_tokens / 1e6 * float(in_rate)
+                        + cb.completion_tokens / 1e6 * float(out_rate))
+                priced = True
+            except ValueError:
+                logger.warning("LLM_COST_*_PER_1M が数値ではないため概算をスキップ")
     usage = st.session_state.setdefault(
-        "llm_usage", {"prompt": 0, "completion": 0, "cost": 0.0, "calls": 0}
+        "llm_usage",
+        {"prompt": 0, "completion": 0, "cost": 0.0, "calls": 0, "unpriced": 0},
     )
+    usage.setdefault("unpriced", 0)
     usage["prompt"]     += cb.prompt_tokens
     usage["completion"] += cb.completion_tokens
-    usage["cost"]       += cost
     usage["calls"]      += cb.successful_requests
+    if priced:
+        usage["cost"] += cost
+    elif cb.prompt_tokens or cb.completion_tokens:
+        usage["unpriced"] += 1
     # Gemini Web検索の使用量も同じタイミングで同期する
     _sync_web_search_usage()
 
 
 def _sync_web_search_usage() -> None:
     """Gemini Web検索のプロセス累積使用量から、このセッション分の差分を積算する。
-    単価は環境変数（GEMINI_COST_INPUT_PER_1M / GEMINI_COST_OUTPUT_PER_1M、
-    USD/100万トークン。既定は gemini-2.0-flash 相当）で調整できる。
+    単価は次の優先順で決める：
+    ① 環境変数 GEMINI_COST_INPUT_PER_1M / GEMINI_COST_OUTPUT_PER_1M（明示設定）
+    ② 使用モデルが既定の gemini-2.0-flash の場合のみ、内蔵の既定単価（0.10/0.40）
+    どちらも該当しない（モデル変更＋単価未設定）場合は金額に計上せず
+    unpriced フラグを立てる（誤った単価で計算しない）。
     検索1回あたりの課金（無料枠超過時）は GEMINI_COST_PER_SEARCH で指定する。"""
     current = get_gemini_usage()
     baseline = st.session_state.get("web_usage_baseline") or {
@@ -305,21 +546,259 @@ def _sync_web_search_usage() -> None:
     d_complete = current["completion_tokens"] - baseline["completion_tokens"]
     d_requests = current["requests"]          - baseline["requests"]
     if d_prompt or d_complete or d_requests:
-        in_rate    = float(os.getenv("GEMINI_COST_INPUT_PER_1M",  "0.10"))
-        out_rate   = float(os.getenv("GEMINI_COST_OUTPUT_PER_1M", "0.40"))
-        per_search = float(os.getenv("GEMINI_COST_PER_SEARCH",    "0"))
+        rates = None
+        in_env  = os.getenv("GEMINI_COST_INPUT_PER_1M")
+        out_env = os.getenv("GEMINI_COST_OUTPUT_PER_1M")
+        model   = os.getenv("GEMINI_WEB_SEARCH_MODEL", "gemini-2.0-flash")
+        if in_env and out_env:
+            try:
+                rates = (float(in_env), float(out_env))
+            except ValueError:
+                logger.warning("GEMINI_COST_*_PER_1M が数値ではないため概算をスキップ")
+        elif model == "gemini-2.0-flash":
+            rates = (0.10, 0.40)
         web = st.session_state.setdefault(
-            "web_usage", {"prompt": 0, "completion": 0, "requests": 0, "cost": 0.0}
+            "web_usage",
+            {"prompt": 0, "completion": 0, "requests": 0, "cost": 0.0, "unpriced": False},
         )
+        web.setdefault("unpriced", False)
         web["prompt"]     += d_prompt
         web["completion"] += d_complete
         web["requests"]   += d_requests
-        web["cost"] += (
-            d_prompt / 1e6 * in_rate
-            + d_complete / 1e6 * out_rate
-            + d_requests * per_search
-        )
+        if rates is not None:
+            per_search = float(os.getenv("GEMINI_COST_PER_SEARCH", "0"))
+            web["cost"] += (
+                d_prompt / 1e6 * rates[0]
+                + d_complete / 1e6 * rates[1]
+                + d_requests * per_search
+            )
+        else:
+            web["unpriced"] = True
     st.session_state.web_usage_baseline = current
+
+
+# ─────────────────────────────────────────
+# 確認フェーズの QA（質問対応）
+# ─────────────────────────────────────────
+def run_qa(question: str, fmt: str = "answer") -> None:
+    """確認フェーズの質問に回答する。ワークフローの状態（interrupt/checkpointer）は
+    一切変更しない。回答は display_messages にのみ積む。
+    fmt: "answer"（回答のみ）／ "html"・"docx"・"pdf"（依頼内容から資料ファイルを作成）"""
+    phase = (st.session_state.interrupt_data or {}).get("phase", "")
+    label = {
+        "policy_review":  "3. 調査方針確認（調査はまだ実施していない）",
+        "results_review": "5. 調査結果確認",
+        "report_review":  "6. レポート確認",
+    }.get(phase) or {
+        "start":           "開始前（ヒアリング未開始）",
+        "confirm_extract": "資料からの抽出結果の確認中（ヒアリング開始前）",
+        "hearing":         "1. ヒアリング中（AIが設備情報を質問している段階。調査は未実施）",
+        "complete":        "7. 完了（レポート承認済み）",
+    }.get(st.session_state.ui_phase, "確認画面")
+    # ヒアリング完了前は state に equipment_info がまだ無いため、
+    # 資料から抽出済みの情報があればそれをコンテキストにする
+    tid = st.session_state.thread_id
+    equipment_info = (
+        get_state_value(tid, "equipment_info")
+        or st.session_state.get("extracted_info")
+        or {}
+    )
+    # 調査結果：results_review 未到達でも state に結果があれば読み取って渡す
+    # （すべて読み取り専用。workflow の state・checkpointer には書き込まない）
+    results = st.session_state.get("results_idata")
+    if not results:
+        law_items = get_state_value(tid, "law_items")
+        if law_items:
+            results = {
+                "summary":          get_state_value(tid, "synthesis_summary") or "",
+                "risk_count":       get_state_value(tid, "risk_count") or {},
+                "law_items":        law_items,
+                "excluded_laws":    get_state_value(tid, "excluded_laws") or [],
+                "uncovered_issues": get_state_value(tid, "uncovered_issues") or [],
+                "issue_coverage":   get_state_value(tid, "issue_coverage") or {},
+            }
+    # 調査で参照した情報源（e-Gov・Web・社内文書のタイトル一覧）
+    search_sources = [
+        {"title": r.get("title", ""), "source": r.get("source", "")}
+        for r in (get_state_value(tid, "search_results") or [])
+        if r.get("title")
+    ]
+    # 質問パネルで添付された資料：テキスト抽出して回答の根拠に使う
+    # （抽出結果は (名前, サイズ) でキャッシュし、連続質問での再抽出を防ぐ。
+    #  案件本体の設備情報・調査には一切反映しない）
+    attached_docs = []
+    doc_cache = st.session_state.setdefault("qa_doc_cache", {})
+    for f in st.session_state.get("qa_files") or []:
+        data = f.getvalue()
+        key = (f.name, len(data))
+        if key not in doc_cache:
+            try:
+                doc_cache[key] = extract_text_from_file(f.name, data)
+            except Exception:
+                logger.exception("QA添付資料のテキスト抽出に失敗: %s", f.name)
+                doc_cache[key] = ""
+        if doc_cache[key].strip():
+            attached_docs.append((f.name, doc_cache[key]))
+
+    context = build_qa_context(
+        equipment_info,
+        st.session_state.get("policy_idata"),
+        results,
+        label,
+        search_sources=search_sources,
+        attached_docs=attached_docs,
+    )
+    # 直近の文脈：メイン画面の会話＋パネル内のQAやり取り
+    # （QAは display_messages に積まないため、qa_history から補う。
+    #  表示用の履歴は全件残し、LLMに渡すのは直近6往復のみ。エラー回答は渡さない）
+    qa_hist = st.session_state.get("qa_history", [])
+    hist_msgs = list(st.session_state.display_messages)
+    for x in qa_hist[-6:]:
+        if x["a"].startswith("⚠️"):
+            continue
+        hist_msgs.append({"role": "user", "content": x["q"]})
+        hist_msgs.append({"role": "qa", "content": x["a"]})
+    history = build_qa_history(hist_msgs)
+
+    try:
+        with get_llm_usage_callback() as cb, trace_run(
+            "qa" if fmt == "answer" else "qa_doc",
+            session_id=st.session_state.thread_id, input=question,
+        ) as lf:
+            try:
+                if fmt == "answer":
+                    answer = answer_question(question, context, history, config=lf)
+                    entry = {"q": question, "a": answer}
+                else:
+                    title, md = generate_document(
+                        question, context, history, config=lf,
+                        slides=(fmt == "pptx"),
+                    )
+                    file_name, data, mime = build_doc_file(fmt, title, md)
+                    entry = {
+                        "q": question,
+                        "a": f"📎 資料を作成しました：**{title}**\n"
+                             f"下のボタンからダウンロードできます（この履歴を消すまで残ります）。",
+                        "file": {"name": file_name, "data": data, "mime": mime},
+                    }
+            finally:
+                _record_llm_usage(cb)
+        # 回答は質問パネル内にのみ表示する（メイン画面の会話には積まない）
+        st.session_state.qa_history = qa_hist + [entry]
+    except Exception:
+        logger.error("QA でエラー:\n%s", traceback.format_exc())
+        st.session_state.qa_history = qa_hist + [{
+            "q": question,
+            "a": "⚠️ 質問への回答中にエラーが発生しました。お手数ですが、もう一度お試しください。"
+                 if fmt == "answer" else
+                 "⚠️ 資料の作成中にエラーが発生しました。お手数ですが、もう一度お試しください"
+                 "（PDFで失敗する場合はHTML・Wordもお試しください）。",
+        }]
+
+
+def render_qa_input():
+    """全フェーズ共通の質問パネル。画面右上（タイトル行の高さ）に固定表示
+    （CSS .st-key-qa_float）し、決定ボタン（案件を進める操作）と視覚的に分離する。"""
+    with st.container(key="qa_float"):
+        with st.popover("💬 AIに質問"):
+            qa_hist = st.session_state.get("qa_history", [])
+            # 見出し行の右上に履歴クリアボタンを置く（履歴がある時だけ表示）
+            hc1, hc2 = st.columns([3, 1.3], vertical_alignment="center")
+            with hc1:
+                st.markdown("**❓ わからないことを、いつでもAIに質問できます**")
+            with hc2:
+                # ボタン幅は列の半分に抑え、右端に寄せる
+                _sp, hb = st.columns([1, 1])
+                with hb:
+                    if qa_hist and st.button(
+                        "🗑️ 質問履歴クリア", key="qa_clear", use_container_width=True,
+                        help="今までの質問・回答をすべて消します",
+                    ):
+                        st.session_state.qa_history = []
+                        st.rerun()
+            st.caption(
+                "質問しても案件は進みません（ヒアリングへの回答・承認・再調査は"
+                "画面内の入力欄・ボタンから）。回答はこのパネル内に表示されます（参考情報）。"
+            )
+            # これまでの質問と回答を古い順にすべて表示する（クリアするまで残る）
+            for i, x in enumerate(qa_hist):
+                q_html = html_lib.escape(x["q"]).replace("\n", "<br>")
+                a_html = html_lib.escape(x["a"]).replace("\n", "<br>")
+                a_html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', a_html)
+                st.markdown(
+                    f'<div class="qa-panel-answer">'
+                    f'<div class="qa-panel-q">Q. {q_html}</div>'
+                    f'<div class="qa-panel-a">{a_html}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                # 資料作成の依頼には、生成ファイルのダウンロードボタンを付ける
+                f = x.get("file")
+                if f:
+                    st.download_button(
+                        label=f"⬇️ {f['name']}",
+                        data=f["data"],
+                        file_name=f["name"],
+                        mime=f["mime"],
+                        key=f"qa_dl_{i}",
+                        type="primary",
+                    )
+
+            # 送信された質問はこのパネル内で処理する（処理中スピナーは履歴の下＝
+            # 最新の位置に表示。メイン画面には何も出さない）
+            pending = st.session_state.pop("pending_qa_question", None)
+            if pending:
+                p_q   = pending["q"]
+                p_fmt = pending.get("fmt", "answer")
+                q_html = html_lib.escape(p_q).replace("\n", "<br>")
+                st.markdown(
+                    f'<div class="qa-panel-answer">'
+                    f'<div class="qa-panel-q">Q. {q_html}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                spinner_msg = (
+                    "💬 質問に回答しています..." if p_fmt == "answer"
+                    else "📄 資料を作成しています...（1分ほどかかる場合があります）"
+                )
+                with st.spinner(spinner_msg):
+                    run_qa(p_q, p_fmt)
+                st.rerun()   # 処理中表示を消し、上の履歴表示に切り替える
+            # 添付はフォームの外に置く（clear_on_submit で消えず、連続質問で使い回せる）
+            st.file_uploader(
+                "📎 資料を添付して質問（任意。回答にのみ使用し、案件・調査には反映されません）",
+                type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
+                accept_multiple_files=True,
+                key="qa_files",
+            )
+            with st.form("qa_form", clear_on_submit=True):
+                q = st.text_area(
+                    "質問内容",
+                    placeholder="例：「特定施設」とはなんですか？　添付資料のこの装置に届出は必要ですか？\n"
+                                "（資料作成の例：この案件の対応事項を上長向けの説明資料にまとめて）",
+                    height=80,
+                    label_visibility="collapsed",
+                )
+                fmt_labels = {
+                    "💬 回答のみ":   "answer",
+                    "🌐 HTML資料":  "html",
+                    "📝 Word資料":  "docx",
+                    "📕 PDF資料":   "pdf",
+                    "📊 PowerPoint資料": "pptx",
+                }
+                fmt_choice = st.radio(
+                    "出力形式",
+                    list(fmt_labels.keys()),
+                    horizontal=True,
+                    help="「HTML・Word・PDF」を選ぶと、入力内容を依頼として"
+                         "資料ファイルを作成し、ダウンロードできます（案件・調査には反映されません）。",
+                )
+                if st.form_submit_button("質問する ➤", type="primary", use_container_width=True):
+                    if q.strip():
+                        st.session_state.pending_qa_question = {
+                            "q": q.strip(), "fmt": fmt_labels[fmt_choice],
+                        }
+                        st.rerun()
 
 
 # ─────────────────────────────────────────
@@ -352,7 +831,7 @@ def invoke_hearing(user_text: str):
 
     try:
         with st.spinner("情報整理・分析中..." if hearing_ending else "AIが考えています..."):
-            with get_openai_callback() as cb, trace_run(
+            with get_llm_usage_callback() as cb, trace_run(
                 "hearing", session_id=st.session_state.thread_id, input=user_text,
             ) as lf:
                 try:
@@ -413,7 +892,7 @@ def start_with_documents(files) -> bool:
                 failed.append(f.name)
         if doc_texts:
             try:
-                with get_openai_callback() as cb, trace_run(
+                with get_llm_usage_callback() as cb, trace_run(
                     "doc_extraction",
                     session_id=st.session_state.thread_id,
                     input=[name for name, _t in doc_texts],
@@ -573,7 +1052,7 @@ def resume_graph(decision):
         # 調査フェーズは各ステップの進捗をライブ表示（stream_mode="custom"）
         status = st.status("🔎 AI調査を開始しています...", expanded=True)
         try:
-            with get_openai_callback() as cb, trace_run(
+            with get_llm_usage_callback() as cb, trace_run(
                 f"search:{current_phase or 'resume'}",
                 session_id=st.session_state.thread_id,
                 input=decision,
@@ -602,7 +1081,7 @@ def resume_graph(decision):
     else:
         try:
             with st.spinner("処理中..."):
-                with get_openai_callback() as cb, trace_run(
+                with get_llm_usage_callback() as cb, trace_run(
                     f"resume:{current_phase or 'resume'}",
                     session_id=st.session_state.thread_id,
                     input=decision,
@@ -704,8 +1183,11 @@ def render_messages():
             idx  = msg["step"]
             icon = PHASE_ICONS[idx]
             name = PHASES[idx]
+            # サイドバーのステップリンクの飛び先。同じステップのバナーが複数ある
+            # 場合（再調査ループ）は最後のバナーだけに付け、id の重複を避ける
+            anchor = f' id="step-anchor-{idx}"' if last_banner_pos.get(idx) == pos else ""
             st.markdown(
-                f'<div class="phase-banner">{icon}　{name}</div>',
+                f'<div class="phase-banner"{anchor}>{icon}　{name}</div>',
                 unsafe_allow_html=True,
             )
             # 各フェーズの詳細を、そのステップの最後のバナー直下に常時アンカー表示する
@@ -789,7 +1271,7 @@ def render_input():
         st.caption(
             "💡 サイドバーの「📁 社内文書」に社内規定・過去の届出事例を登録しておくと、"
             "AIが調査時に社内文書も検索します。また、レポートを承認した案件は"
-            "「🧠 ケースメモリ」に蓄積され、次回の類似案件で自動的に参照されます（使うほど賢くなります）。"
+            "「📚 過去の調査事例」に蓄積され、次回の類似案件で自動的に参照されます（使うほど賢くなります）。"
         )
         files = st.file_uploader(
             "関連資料（PDF / Word / Excel / PowerPoint / テキスト・複数可）",
@@ -838,14 +1320,20 @@ def render_input():
                 height=80,
             )
             submitted = st.form_submit_button("送信 ➤", type="primary", use_container_width=True)
-            if submitted and txt.strip():
-                submit_hearing_answer(txt.strip())
 
         st.caption("よく使う選択肢：")
         cols = st.columns(5)
+        clicked = None
         for i, opt in enumerate(["あり", "なし", "不明", "未定", "確認中"]):
             if cols[i].button(opt, key=f"q_{opt}", use_container_width=True):
-                submit_hearing_answer(opt)
+                clicked = opt
+
+        # 送信処理は全ウィジェットの描画後に行う。クリックハンドラ内（描画途中）で
+        # 重いLLM処理を実行すると、処理中に未描画の後続ボタンが消えてしまう
+        if submitted and txt.strip():
+            submit_hearing_answer(txt.strip())
+        elif clicked:
+            submit_hearing_answer(clicked)
 
     # ── interrupt: 調査内容確認 ──
     elif ui == "interrupt" and idata and idata.get("phase") == "policy_review":
@@ -881,7 +1369,7 @@ def render_input():
             st.rerun()
         if st.session_state.report_html:
             from datetime import datetime
-            file_name = datetime.now().strftime("%Y%m%d_%H%M") + "_法令確認･届出施設確認AI作成レポート.html"
+            file_name = datetime.now().strftime("%Y%m%d_%H%M") + "_法令･届出施設確認サポートAI作成レポート.html"
             c2.download_button(
                 label="⬇️ レポートをダウンロード",
                 data=st.session_state.report_html.encode("utf-8"),
@@ -889,6 +1377,9 @@ def render_input():
                 mime="text/html",
                 use_container_width=True,
             )
+
+    # ── 全フェーズ共通：右下固定の質問パネル（いつでも質問できる） ──
+    render_qa_input()
 
 
 # ─────────────────────────────────────────
@@ -912,12 +1403,12 @@ def render_policy_detail(idata: dict, expanded: bool = True):
         st.markdown(
             f'<div style="border:1px solid #FFB74D;border-left:6px solid #FB8C00;'
             f'border-radius:8px;background:#FFF8E1;padding:14px 18px;margin:10px 0;">'
-            f'<div style="color:#E65100;font-weight:700;font-size:15px;margin-bottom:6px;">'
+            f'<div style="color:#E65100;font-weight:700;font-size:16px;margin-bottom:6px;">'
             f'⚠️ 調査前に確認した方がよい不明・未定情報</div>'
-            f'<div style="color:#6D4C41;font-size:13px;margin-bottom:10px;">'
+            f'<div style="color:#C62828;font-weight:700;font-size:16px;margin-bottom:10px;">'
             f'下記が未確定だと必要な法令確認・届出確認が漏れる恐れがあります。'
             f'「調査前に追記する」から補足してから調査を開始することを推奨します。</div>'
-            f'<ul style="margin:0;padding-left:20px;color:#4E342E;font-size:14px;">{items_html}</ul>'
+            f'<ul style="margin:0;padding-left:20px;color:#4E342E;font-size:16px;">{items_html}</ul>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -926,6 +1417,38 @@ def render_policy_detail(idata: dict, expanded: bool = True):
         st.write(to_ja_field_names(idata.get("search_plan", "")))
         st.caption("検索キーワード（e-Gov法令API）: " + " / ".join(idata.get("search_keywords", [])))
         st.caption("🌐 AIWeb検索（自動実施） ● 横浜市・神奈川県の条例・規制（公式サイト） ● 省庁ガイドライン・FAQ（厚生労働省・消防庁・環境省・国土交通省・経済産業省）")
+
+
+def _build_attachment_note(files, total_cap: int = 8000) -> tuple:
+    """添付資料からテキストを抽出し、AIへの追記指示に含める抜粋文字列を作る。
+    追記はその後の全プロンプトに毎回入るため、合計 total_cap 字までに抜粋する。
+    戻り値: (抜粋テキスト, 読み取れなかったファイル名リスト)"""
+    doc_note = ""
+    failed = []
+    if files:
+        per_cap = max(2000, total_cap // len(files))
+        for f in files:
+            try:
+                txt = extract_text_from_file(f.name, f.getvalue())
+            except Exception:
+                logger.exception("添付資料のテキスト抽出に失敗: %s", f.name)
+                txt = ""
+            if txt.strip():
+                doc_note += (
+                    f"\n\n【添付資料「{f.name}」の内容抜粋】\n" + txt.strip()[:per_cap]
+                )
+            else:
+                failed.append(f.name)
+    return doc_note, failed
+
+
+def _notify_unreadable_files(failed_files) -> None:
+    if failed_files:
+        add_display(
+            "system",
+            "⚠️ テキストを読み取れなかった資料（スキャン画像のPDF等）："
+            + "、".join(failed_files),
+        )
 
 
 def render_policy_review(idata: dict):
@@ -953,10 +1476,23 @@ def render_policy_review(idata: dict):
         if st.session_state.get("show_note_form"):
             with st.form("policy_note"):
                 note = st.text_area("追記内容：", placeholder="例：消防署は○○消防署に絞ってください")
+                note_files = st.file_uploader(
+                    "📎 追加資料（任意）。内容を読み取り、追記指示と一緒に調査の参考情報としてAIに渡します",
+                    type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
+                    accept_multiple_files=True,
+                    key="policy_note_files",
+                )
                 if st.form_submit_button("✅　追記して調査を開始する", type="primary", use_container_width=True):
                     st.session_state.show_note_form = False
-                    add_display("user", f"調査方針を承認しました。追記：{note}")
-                    request_resume(f"approved: {note}")
+                    with st.spinner("添付資料を読み取り中..."):
+                        doc_note, failed_files = _build_attachment_note(note_files)
+                    combined = (note.strip() + doc_note).strip()
+                    disp = f"調査方針を承認しました。追記：{note.strip()}"
+                    if note_files:
+                        disp += f"（添付資料：{'、'.join(f.name for f in note_files)}）"
+                    add_display("user", disp)
+                    _notify_unreadable_files(failed_files)
+                    request_resume(f"approved: {combined}" if combined else "approved")
     with c2:
         if st.button("✅　この方針で調査を開始する", type="primary", use_container_width=True):
             add_display("user", "調査方針を承認しました。調査を開始してください。")
@@ -1006,11 +1542,11 @@ def render_results_detail(idata: dict):
         st.markdown(
             f'<div style="border:1px solid #EF9A9A;border-left:6px solid #C62828;'
             f'border-radius:8px;background:#FFEBEE;padding:14px 18px;margin:10px 0;">'
-            f'<div style="color:#B71C1C;font-weight:700;font-size:15px;margin-bottom:6px;">'
+            f'<div style="color:#B71C1C;font-weight:700;font-size:16px;margin-bottom:6px;">'
             f'🚨 網羅性チェック NG：対応法令を確認できなかった論点</div>'
-            f'<div style="color:#7F1D1D;font-size:13px;margin-bottom:10px;">'
+            f'<div style="color:#7F1D1D;font-size:16px;margin-bottom:10px;">'
             f'{summary_line} 確認漏れ・届出漏れを防ぐため、担当部署・所轄機関への直接確認を推奨します。</div>'
-            f'<ul style="margin:0;padding-left:20px;color:#4E342E;font-size:14px;">{items_html}</ul>'
+            f'<ul style="margin:0;padding-left:20px;color:#4E342E;font-size:16px;">{items_html}</ul>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -1167,7 +1703,7 @@ def render_results_detail(idata: dict):
                         '<span style="color:#888;">条番号確認中'
                         '<span style="font-size:11px;">'
                         '（横浜市・神奈川県の条例は e-Gov 未収載のため、原文照合による'
-                        '条番号の自動特定ができません。横浜市例規集・神奈川県例規集で'
+                        '条番号の自動特定ができません。下の例規集リンクから'
                         '直接ご確認ください）'
                         '</span></span>'
                     )
@@ -1221,9 +1757,10 @@ def render_results_detail(idata: dict):
                 )
             elif is_ordinance:
                 egov_link_html = (
-                    '<span style="font-size:12px;color:#888;">'
-                    '📚 条例の原文は「横浜市例規集」「神奈川県例規集」で検索して'
-                    'ご確認ください（e-Gov 未収載）</span>'
+                    f'<span style="font-size:12px;">'
+                    f'{ordinance_links_html(law_name)}'
+                    f'<span style="color:#888;">　（e-Gov 未収載のため公式例規集で原文をご確認ください）</span>'
+                    f'</span>'
                 )
             else:
                 egov_link_html = (
@@ -1311,7 +1848,10 @@ def render_results_detail(idata: dict):
                         unsafe_allow_html=True,
                     )
             else:
-                st.caption("届出・申請事項なし（要確認）")
+                st.caption(
+                    "📋 届出・申請事項：未特定（「届出不要」の意味ではありません。"
+                    "適用が確定した場合は再調査で特定できます）"
+                )
 
             st.markdown("")
 
@@ -1389,13 +1929,25 @@ def render_results_review(idata: dict):
                     "追加調査の依頼内容：",
                     placeholder="例：高圧ガス保安法の確認が抜けていそう。冷媒の充填量の観点でも再調査してください。",
                 )
+                reinvest_files = st.file_uploader(
+                    "📎 追加資料（任意）。内容を読み取り、依頼内容と一緒に再調査の参考情報としてAIに渡します",
+                    type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
+                    accept_multiple_files=True,
+                    key="reinvest_files",
+                )
                 if st.form_submit_button("🔍　この内容で追加調査を依頼する", type="primary", use_container_width=True):
-                    if req.strip():
+                    if req.strip() or reinvest_files:
                         st.session_state.show_reinvest_form = False
-                        add_display("user", f"追加調査を依頼しました：{req.strip()}")
-                        request_resume(f"reinvestigate: {req.strip()}")
+                        with st.spinner("添付資料を読み取り中..."):
+                            doc_note, failed_files = _build_attachment_note(reinvest_files)
+                        disp = f"追加調査を依頼しました：{req.strip()}"
+                        if reinvest_files:
+                            disp += f"（添付資料：{'、'.join(f.name for f in reinvest_files)}）"
+                        add_display("user", disp)
+                        _notify_unreadable_files(failed_files)
+                        request_resume(f"reinvestigate: {(req.strip() + doc_note).strip()}")
                     else:
-                        st.warning("依頼内容を入力してください。")
+                        st.warning("依頼内容を入力するか、資料を添付してください。")
     with c2:
         if st.button("📝　調査不足なし・レポートを作成する", type="primary", use_container_width=True):
             add_display("user", "結果レビューが完了しました。レポートを作成してください。")
@@ -1415,7 +1967,7 @@ def render_report_review(idata: dict):
 
     if report_html:
         from datetime import datetime
-        file_name = datetime.now().strftime("%Y%m%d_%H%M") + "_法令確認･届出施設確認AI作成レポート.html"
+        file_name = datetime.now().strftime("%Y%m%d_%H%M") + "_法令･届出施設確認サポートAI作成レポート.html"
         st.download_button(
             label     = "⬇️ レポートをダウンロード",
             data      = report_html.encode("utf-8"),
@@ -1446,17 +1998,32 @@ def render_report_review(idata: dict):
                     placeholder="文面修正の例：○○の対応内容をもっと具体的な表現にしてほしい\n"
                                 "再調査の例：消防法の危険物の届出が抜けていそうなので再確認して",
                 )
+                revise_files = st.file_uploader(
+                    "📎 追加資料（任意）。内容を読み取り、依頼内容と一緒にAIに渡します",
+                    type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
+                    accept_multiple_files=True,
+                    key="report_revise_files",
+                )
                 if st.form_submit_button("この内容で依頼する", type="primary", use_container_width=True):
-                    if not txt.strip():
-                        st.warning("依頼内容を入力してください。")
-                    elif mode.startswith("📝"):
-                        st.session_state.show_revise_form = False
-                        add_display("user", f"レポート文面の修正を依頼：{txt.strip()}")
-                        request_resume(f"refine: {txt.strip()}")
+                    if not (txt.strip() or revise_files):
+                        st.warning("依頼内容を入力するか、資料を添付してください。")
                     else:
                         st.session_state.show_revise_form = False
-                        add_display("user", f"追加調査を依頼：{txt.strip()}")
-                        request_resume(f"reinvestigate: {txt.strip()}")
+                        with st.spinner("添付資料を読み取り中..."):
+                            doc_note, failed_files = _build_attachment_note(revise_files)
+                        combined = (txt.strip() + doc_note).strip()
+                        names = (
+                            f"（添付資料：{'、'.join(f.name for f in revise_files)}）"
+                            if revise_files else ""
+                        )
+                        if mode.startswith("📝"):
+                            add_display("user", f"レポート文面の修正を依頼：{txt.strip()}{names}")
+                            _notify_unreadable_files(failed_files)
+                            request_resume(f"refine: {combined}")
+                        else:
+                            add_display("user", f"追加調査を依頼：{txt.strip()}{names}")
+                            _notify_unreadable_files(failed_files)
+                            request_resume(f"reinvestigate: {combined}")
     with col2:
         if st.button("✅　確認完了・承認する", type="primary", use_container_width=True):
             st.session_state.report_html = report_html  # complete画面でも参照できるよう保存
@@ -1469,39 +2036,110 @@ def render_report_review(idata: dict):
 # ─────────────────────────────────────────
 def render_sidebar():
     with st.sidebar:
+        # この後の render_input で調査・レポート生成などの重い処理が実行される
+        # サイクルでは、ボタン操作が Streamlit の rerun を誘発して処理を中断
+        # してしまうため、サイドバーの操作を無効化する
+        busy = "pending_resume_decision" in st.session_state
         # AI利用コスト（スクロールせずに見えるよう最上部に表示。詳細は折りたたみ）
+        # Langfuse 設定時：Langfuse が計算した実測コストを取得して表示する
+        # （アプリ側では概算しない。表示は数秒〜十数秒遅れることがある）
+        if langfuse_enabled():
+            jpy_rate = float(os.getenv("LLM_COST_JPY_RATE", "150"))
+            # Langfuse 側の集計反映は数十秒遅れるため、結果はキャッシュしつつ
+            # 自動で再取得する（未反映のうちは15秒間隔・反映後は60秒間隔）。
+            if st.session_state.ui_phase != "start" and not busy:
+                lf_cost = st.session_state.get("lf_cost")
+                interval = 60 if (lf_cost and lf_cost.get("traces")) else 15
+                if time.time() - st.session_state.get("lf_cost_ts", 0) > interval:
+                    fetched = get_session_cost(st.session_state.thread_id)
+                    if fetched is not None:
+                        st.session_state.lf_cost = fetched
+                    st.session_state.lf_cost_ts = time.time()
+            lf_cost = st.session_state.get("lf_cost")
+            if lf_cost and lf_cost.get("traces"):
+                headline = (
+                    f'💰 <b>AI利用コスト ${lf_cost["cost"]:.3f}</b>'
+                    f'（約 {lf_cost["cost"] * jpy_rate:,.0f}円）<br>'
+                    f'<span style="font-size:11px;color:#777;">'
+                    f'Langfuse 実測値（ヒアリング・調査などの処理 {lf_cost["traces"]}回分の合計。'
+                    f'検索回数とは別の数字です）</span>'
+                )
+            elif st.session_state.ui_phase == "start":
+                headline = (
+                    f'💰 <b>AI利用コスト</b><br>'
+                    f'<span style="font-size:11px;color:#777;">'
+                    f'開始後に Langfuse の実測値を表示します</span>'
+                )
+            else:
+                headline = (
+                    f'💰 <b>AI利用コスト：集計待ち</b><br>'
+                    f'<span style="font-size:11px;color:#777;">'
+                    f'Langfuse への反映に数十秒かかることがあります。'
+                    f'画面操作時に自動更新されます</span>'
+                )
+            st.markdown(
+                f'<div class="sidebar-card">{headline}</div>',
+                unsafe_allow_html=True,
+            )
+            if st.session_state.ui_phase != "start":
+                if st.button(
+                    "🔄 コスト表示を更新", use_container_width=True, key="lf_cost_refresh",
+                    disabled=busy,
+                    help="調査などの処理中は、中断を防ぐため更新できません" if busy else None,
+                ):
+                    with st.spinner("Langfuse から取得中..."):
+                        st.session_state.lf_cost = get_session_cost(st.session_state.thread_id)
+                    st.rerun()
+            st.divider()
+
         usage = st.session_state.get("llm_usage")
         if usage and usage.get("calls"):
             jpy_rate = float(os.getenv("LLM_COST_JPY_RATE", "150"))
             web = st.session_state.get("web_usage") or {}
             total_cost = usage["cost"] + (web.get("cost") or 0.0)
+            has_unpriced = bool(usage.get("unpriced")) or bool(web.get("unpriced"))
             web_line = f"　Web検索: {web['requests']}回" if web.get("requests") else ""
+            # 単価不明の使用分がある場合は、誤った金額を出さずその旨を明示する
+            if has_unpriced and total_cost <= 0:
+                headline = "💰 <b>AI利用コスト：単価不明のため金額なし</b>"
+            elif has_unpriced:
+                headline = (
+                    f'💰 <b>AI利用コスト ${total_cost:.3f}＋α</b>'
+                    f'（約 {total_cost * jpy_rate:,.0f}円＋α・一部単価不明）'
+                )
+            else:
+                headline = (
+                    f'💰 <b>AI利用コスト ${total_cost:.3f}</b>'
+                    f'（約 {total_cost * jpy_rate:,.0f}円）'
+                )
             st.markdown(
                 f'<div class="sidebar-card">'
-                f'💰 <b>AI利用コスト ${total_cost:.3f}</b>'
-                f'（約 {total_cost * jpy_rate:,.0f}円）<br>'
+                f'{headline}<br>'
                 f'<span style="font-size:11px;color:#777;">'
                 f'LLM: {usage["calls"]}回{web_line}</span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
             with st.expander("コスト内訳"):
+                llm_amount = f"　${usage['cost']:.3f}" if usage["cost"] else "　（単価不明）"
                 st.caption(
                     f"LLM 入力: {usage['prompt']:,} / 出力: {usage['completion']:,} トークン"
-                    f"　${usage['cost']:.3f}"
+                    f"{llm_amount}"
                 )
                 if web.get("requests"):
+                    web_amount = f"　${web['cost']:.3f}" if web.get("cost") else "　（単価不明）"
                     st.caption(
                         f"Web検索 入力: {web['prompt']:,} / 出力: {web['completion']:,} トークン"
-                        f"　${web['cost']:.3f}"
+                        f"{web_amount}"
+                    )
+                if has_unpriced:
+                    st.caption(
+                        "⚠️ 使用モデルの単価が不明な呼び出しがあり、その分は金額に含まれていません。"
+                        "正確に把握するには .env で単価（LLM_COST_INPUT_PER_1M / "
+                        "LLM_COST_OUTPUT_PER_1M、Web検索は GEMINI_COST_*）を設定するか、"
+                        "Langfuse をご利用ください。"
                     )
                 st.caption("※ 埋め込み（社内文書登録・検索）のコストは含みません。")
-                if langfuse_enabled():
-                    lf_host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
-                    st.caption(
-                        f"※ 表示は概算です。正確なコスト・リクエスト内容のトレースは "
-                        f"[Langfuse]({lf_host}) で確認できます。"
-                    )
             st.divider()
 
         st.markdown("## ⚖️ ステップ")
@@ -1515,13 +2153,29 @@ def render_sidebar():
         st.caption(f"ステップ {phase_idx + 1} / {len(PHASES)}")
 
         all_done = st.session_state.ui_phase == "complete"
+        # バナーが表示済みのステップはクリックでその位置へスクロールできるリンクにする
+        reached_steps = {
+            m.get("step") for m in st.session_state.display_messages
+            if m.get("role") == "step_banner"
+        }
         for i, phase in enumerate(PHASES):
             if i < phase_idx or all_done:
-                st.write(f"✅ {phase}")
+                mark, weight = "✅", ""
             elif i == phase_idx:
-                st.write(f"▶️ **{phase}**")
+                mark, weight = "▶️", "font-weight:700;"
             else:
-                st.write(f"⬜ {phase}")
+                mark, weight = "⬜", ""
+            if i in reached_steps:
+                st.markdown(
+                    f'<a href="#step-anchor-{i}" target="_self" '
+                    f'style="display:block;text-decoration:none;color:inherit;'
+                    f'{weight}margin:4px 0;">{mark} {phase}</a>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.write(f"{mark} {phase}")
+        if reached_steps:
+            st.caption("クリックすると、その工程の位置までスクロールします。")
 
         st.divider()
 
@@ -1584,7 +2238,8 @@ def render_sidebar():
                         f'<span style="color:#888;">（{r["chunks"]}チャンク）</span></div>',
                         unsafe_allow_html=True,
                     )
-                    if c2.button("🗑️", key=f"del_doc_{r['name']}", help="この文書をインデックスから削除"):
+                    if c2.button("🗑️", key=f"del_doc_{r['name']}", help="この文書をインデックスから削除",
+                                 disabled=busy):
                         delete_internal_doc(r["name"])
                         st.rerun()
 
@@ -1593,15 +2248,16 @@ def render_sidebar():
                     st.warning(f"登録済み {len(registered)} ファイルをすべて削除します。よろしいですか？")
                     dc1, dc2 = st.columns(2)
                     if dc1.button("削除する", type="primary", key="do_delete_all_docs",
-                                  use_container_width=True):
+                                  use_container_width=True, disabled=busy):
                         delete_all_internal_docs()
                         st.session_state.confirm_delete_all_docs = False
                         st.rerun()
                     if dc2.button("キャンセル", key="cancel_delete_all_docs",
-                                  use_container_width=True):
+                                  use_container_width=True, disabled=busy):
                         st.session_state.confirm_delete_all_docs = False
                         st.rerun()
-                elif st.button("🗑️ すべて削除", key="delete_all_docs_btn", use_container_width=True):
+                elif st.button("🗑️ すべて削除", key="delete_all_docs_btn", use_container_width=True,
+                               disabled=busy):
                     st.session_state.confirm_delete_all_docs = True
                     st.rerun()
             else:
@@ -1615,8 +2271,10 @@ def render_sidebar():
                 type=["pdf", "docx", "xlsx", "xlsm", "pptx", "txt"],
                 accept_multiple_files=True,
                 key="internal_docs_uploader",
+                disabled=busy,
             )
-            if up_files and st.button("📥 登録（ベクトル化）", use_container_width=True):
+            if up_files and st.button("📥 登録（ベクトル化）", use_container_width=True,
+                                      disabled=busy):
                 with st.spinner("社内文書を登録中...（埋め込みを生成しています）"):
                     try:
                         st.session_state.ingest_result = ingest_internal_docs(
@@ -1628,7 +2286,7 @@ def render_sidebar():
                 st.rerun()
 
         # ケースメモリ（承認済み過去案件・CBR）の管理
-        with st.expander("🧠 ケースメモリ（過去案件）"):
+        with st.expander("📚 過去の調査事例（AIが自動で参考にします）"):
             saved_cases = list_cases()
             if saved_cases:
                 st.caption(
@@ -1643,7 +2301,8 @@ def render_sidebar():
                         f'・法令{c["law_count"]}件・{c["saved_at"]}</span></div>',
                         unsafe_allow_html=True,
                     )
-                    if cc2.button("🗑️", key=f"del_case_{c['case_id']}", help="この事例をケースメモリから削除"):
+                    if cc2.button("🗑️", key=f"del_case_{c['case_id']}", help="この事例を削除（AIが参照しなくなります）",
+                                  disabled=busy):
                         delete_case(c["case_id"])
                         st.rerun()
             else:
@@ -1667,7 +2326,9 @@ def render_sidebar():
 # 自動スクロール（最下部へ）
 # ─────────────────────────────────────────
 def _embed_html(html_str: str, height: int = 1):
-    """HTML（JavaScript含む）を iframe として埋め込む。height は 1 以上にする。"""
+    """HTML（JavaScript含む）を iframe として埋め込む。height は 1 以上にする。
+    components.html は HTML 文字列を srcdoc 埋め込み（same-origin・scripts 許可）
+    するので、スクリプトから window.parent.document へのアクセスも従来どおり動く。"""
     components.html(html_str, height=max(1, height))
 
 
@@ -1730,29 +2391,42 @@ def auto_scroll(duration_ms: int = 1200):
 # ─────────────────────────────────────────
 # メイン
 # ─────────────────────────────────────────
-def main():
-    init()
-    render_sidebar()
-
-    st.title("⚖️ 法令確認・届出施設確認AI")
-    st.caption(
-        "設備導入時の法令確認・届出施設確認をAIがEnd to Endでサポートします。"
-        "　|　対象：横浜市内の会社施設"
-    )
-
-    st.divider()
-
-    if not st.session_state.display_messages and st.session_state.ui_phase == "start":
-        st.markdown("""
+WELCOME_HTML = """
 <div style="background:#E8F5E9;border-left:4px solid #43A047;padding:14px 18px;border-radius:4px;margin-bottom:16px">
-👋 <b>ようこそ！</b> 法令確認・届出施設確認AIです。<br>
+👋 <b>ようこそ！</b> 法令・届出施設確認サポートAIです。<br>
 設備情報をヒアリングし、横浜市内の会社施設で設備を導入する際に必要な法令・届出施設をAIが調査・報告します。<br>
 仕様書などの関連資料をアップロードすると、AIが設備情報を自動で読み取り、ヒアリングでの手入力を減らせます。<br>
 まず「開始する」を押すと、AIが設備情報のヒアリング（資料がある場合は抽出結果の確認）を開始します。<br><br>
 <b>進め方：</b> 1. ヒアリング → 2. 情報整理・分析 → 3. 調査方針確認 → 4. 調査実施 → 5. 調査結果確認 → 6. レポート作成 → 7. 完了確認
 </div>
-""", unsafe_allow_html=True)
+<div style="background:#FFF8E1;border-left:4px solid #FB8C00;padding:12px 18px;border-radius:4px;margin-bottom:16px;color:#5D4037;">
+⚠️ <b>ご利用にあたって：</b>本ツールは調査を補助する「サポートAI」であり、法令の適用有無・届出の要否を<b>断定するものではありません</b>。
+AIの調査結果・提案はすべて参考情報です（生成AIの利用規約上も、人の確認を経ない法的判断の自動化はできません）。
+<b>最終判断は必ず担当者が行ってください。</b>
+</div>
+"""
+
+
+def main():
+    init()
+    render_sidebar()
+
+    st.title("⚖️ 法令・届出施設確認サポートAI")
+
+    st.divider()
+
+    if st.session_state.ui_phase == "start":
+        st.markdown(WELCOME_HTML, unsafe_allow_html=True)
     else:
+        # 開始後も説明文を消さず、折りたたみで常設表示する
+        with st.expander("ℹ️ このツールの使い方・注意事項", expanded=False):
+            st.markdown(WELCOME_HTML, unsafe_allow_html=True)
+            st.caption(
+                "💡 サイドバーの「📁 社内文書」に社内規定・過去の届出事例を登録しておくと、"
+                "AIが調査時に社内文書も検索します。また、レポートを承認した案件は"
+                "「📚 過去の調査事例」に蓄積され、次回の類似案件で自動的に参照されます"
+                "（使うほど賢くなります）。"
+            )
         render_messages()
 
     st.divider()
