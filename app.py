@@ -49,7 +49,7 @@ from backend.tools.internal_docs import (
 )
 from backend.case_memory import list_cases, delete_case
 from backend.report_gen import ordinance_links_html
-from backend.tools.web_search import get_gemini_usage
+from backend.tools.web_search import get_gemini_usage, search_web
 from backend.observability import trace_run, langfuse_enabled, get_session_cost
 from backend.qa import (
     answer_question, generate_document,
@@ -580,10 +580,11 @@ def _sync_web_search_usage() -> None:
 # ─────────────────────────────────────────
 # 確認フェーズの QA（質問対応）
 # ─────────────────────────────────────────
-def run_qa(question: str, fmt: str = "answer") -> None:
+def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
     """確認フェーズの質問に回答する。ワークフローの状態（interrupt/checkpointer）は
     一切変更しない。回答は display_messages にのみ積む。
-    fmt: "answer"（回答のみ）／ "html"・"docx"・"pdf"（依頼内容から資料ファイルを作成）"""
+    fmt: "answer"（回答のみ）／ "html"・"docx"・"pdf"・"pptx"（依頼内容から資料ファイルを作成）
+    use_web: True の場合、質問文でWeb検索を実行し、結果を回答・資料の根拠に加える"""
     phase = (st.session_state.interrupt_data or {}).get("phase", "")
     label = {
         "policy_review":  "3. 調査方針確認（調査はまだ実施していない）",
@@ -640,6 +641,15 @@ def run_qa(question: str, fmt: str = "answer") -> None:
         if doc_cache[key].strip():
             attached_docs.append((f.name, doc_cache[key]))
 
+    # 質問パネルからの任意Web検索：質問文をそのままクエリにして参考情報を取得する
+    # （案件本体の調査とは独立。使用量は _record_llm_usage → _sync_web_search_usage で積算）
+    qa_web_results = []
+    if use_web:
+        try:
+            qa_web_results = search_web(question)
+        except Exception:
+            logger.error("QAのWeb検索でエラー:\n%s", traceback.format_exc())
+
     context = build_qa_context(
         equipment_info,
         st.session_state.get("policy_idata"),
@@ -647,6 +657,7 @@ def run_qa(question: str, fmt: str = "answer") -> None:
         label,
         search_sources=search_sources,
         attached_docs=attached_docs,
+        web_results=qa_web_results,
     )
     # 直近の文脈：メイン画面の会話＋パネル内のQAやり取り
     # （QAは display_messages に積まないため、qa_history から補う。
@@ -750,6 +761,7 @@ def render_qa_input():
             if pending:
                 p_q   = pending["q"]
                 p_fmt = pending.get("fmt", "answer")
+                p_web = bool(pending.get("web"))
                 q_html = html_lib.escape(p_q).replace("\n", "<br>")
                 st.markdown(
                     f'<div class="qa-panel-answer">'
@@ -761,8 +773,10 @@ def render_qa_input():
                     "💬 質問に回答しています..." if p_fmt == "answer"
                     else "📄 資料を作成しています...（1分ほどかかる場合があります）"
                 )
+                if p_web:
+                    spinner_msg = "🌐 Web検索中... → " + spinner_msg
                 with st.spinner(spinner_msg):
-                    run_qa(p_q, p_fmt)
+                    run_qa(p_q, p_fmt, use_web=p_web)
                 st.rerun()   # 処理中表示を消し、上の履歴表示に切り替える
             # 添付はフォームの外に置く（clear_on_submit で消えず、連続質問で使い回せる）
             st.file_uploader(
@@ -790,13 +804,19 @@ def render_qa_input():
                     "出力形式",
                     list(fmt_labels.keys()),
                     horizontal=True,
-                    help="「HTML・Word・PDF」を選ぶと、入力内容を依頼として"
+                    help="「HTML・Word・PDF・PowerPoint」を選ぶと、入力内容を依頼として"
                          "資料ファイルを作成し、ダウンロードできます（案件・調査には反映されません）。",
+                )
+                use_web = st.checkbox(
+                    "🌐 Web検索を使う（最新の公開情報を検索して回答・資料の根拠に加える）",
+                    value=False,
+                    help="質問文でWeb検索（Google検索）を実行し、その結果も参考にします。"
+                         "案件本体の調査には反映されません。少し時間と費用がかかります。",
                 )
                 if st.form_submit_button("質問する ➤", type="primary", use_container_width=True):
                     if q.strip():
                         st.session_state.pending_qa_question = {
-                            "q": q.strip(), "fmt": fmt_labels[fmt_choice],
+                            "q": q.strip(), "fmt": fmt_labels[fmt_choice], "web": use_web,
                         }
                         st.rerun()
 
@@ -1351,8 +1371,6 @@ def render_input():
     # ── 完了 ──
     elif ui == "complete":
         st.success("✅ 全プロセスが完了しました！")
-        if st.session_state.get("report_saved_path"):
-            st.caption(f"💾 レポートは `{st.session_state.report_saved_path}` に自動保存済みです。")
         c1, c2 = st.columns(2)
         if st.session_state.get("confirm_new_case"):
             with c1:

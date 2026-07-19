@@ -27,10 +27,11 @@ from backend.state import AppState
 from backend.prompts import (
     HEARING_SYSTEM, ANALYSIS_SYSTEM, SYNTHESIS_SYSTEM, SEARCH_AGENT_SYSTEM,
     ARTICLE_SELECTION_SYSTEM, PRE_SYNTHESIS_ARTICLE_SYSTEM, COVERAGE_CHECK_SYSTEM,
+    SUPPLEMENTAL_LAW_SYSTEM,
 )
 from backend.tools.egov import (
     search_laws_by_keyword, fetch_article_list, fetch_article_text,
-    normalize_article_ref, get_suggested_keywords,
+    normalize_article_ref, get_suggested_keywords, resolve_law_alias,
 )
 from backend.tools.web_search import search_web
 from backend.tools.internal_docs import search_internal_docs, internal_docs_available
@@ -172,6 +173,11 @@ class ExcludedLaw(BaseModel):
     )
 
 
+class AdditionalCheckLaw(BaseModel):
+    law_name: str = Field(description="調査結果一覧に根拠情報はないが、一般知識から適用の可能性が否定できない法令名（正式名称）")
+    reason: str = Field(description="設備情報のどの点から適用の可能性があると考えるか（1〜2文）")
+
+
 class SynthesisResult(BaseModel):
     law_items: list[LawItem] = Field(description="法令別の対応事項リスト")
     summary: str = Field(description="調査結果の総括（3〜5行）")
@@ -179,6 +185,25 @@ class SynthesisResult(BaseModel):
     excluded_laws: list[ExcludedLaw] = Field(
         default_factory=list,
         description="主要法令領域のうち、確認したが非該当と判断した法令と理由のリスト",
+    )
+    additional_check_laws: list[AdditionalCheckLaw] = Field(
+        default_factory=list,
+        description="調査結果に根拠はないが適用の可能性が否定できない追加調査候補（0〜5件）",
+    )
+
+
+class SupplementalJudgment(BaseModel):
+    law_name: str = Field(description="判定対象の法令名（候補と同じ名称）")
+    verdict: Literal["check", "excluded"] = Field(
+        description="check: 適用の可能性が否定できない（要確認） / excluded: 設備情報から明確に非該当"
+    )
+    reason: str = Field(description="判定理由（設備情報のどの回答に基づくか）")
+
+
+class SupplementalResult(BaseModel):
+    judgments: list[SupplementalJudgment] = Field(
+        default_factory=list,
+        description="候補法令全件分の判定リスト",
     )
 
 
@@ -1196,8 +1221,118 @@ def synthesis_node(state: AppState) -> dict:
             })
             existing_names.add(e.law_name)
 
-    # e-Gov の law_id / law_revision_id を法令名で逆引きして付与
+    # ── 確認漏れ防止の自己修復 ──
+    # (1) ルールベース必須法令との突合で最終リストから欠落した法令、
+    # (2) 統合LLMが挙げた「調査結果に根拠がない追加調査候補（additional_check_laws）」を、
+    # e-Gov実在確認＋LLM追加判定で「要確認」か「非該当＋理由」に必ず振り分ける。
+    # （従来はレポートの突合チェックで「⚠️ 未掲載」警告を出すだけだった）
     search_results = state.get("search_results", [])
+    try:
+        def _hit(base: str, names) -> bool:
+            cands = {c for c in (base, resolve_law_alias(base)) if c}
+            return any(n and any(c in n or n in c for c in cands) for n in names)
+
+        current_names = (
+            [l.get("law_name", "") for l in law_items]
+            + [e.get("law_name", "") for e in excluded_laws]
+        )
+        candidates: list[dict] = []
+        for base in get_suggested_keywords(equipment_info):
+            if not _hit(base, current_names):
+                candidates.append({
+                    "law_name": resolve_law_alias(base),
+                    "origin":   "設備属性から機械的に導出した必須確認法令",
+                    "reason":   "設備属性に対応する必須確認法令だが、調査の最終リストに含まれていない",
+                })
+        for a in result.additional_check_laws:
+            name = resolve_law_alias(str(a.law_name or "").strip())
+            if name and not _hit(name, current_names) \
+                    and not _hit(name, [c["law_name"] for c in candidates]):
+                candidates.append({
+                    "law_name": name,
+                    "origin":   "統合AIが一般知識から挙げた追加調査候補",
+                    "reason":   a.reason,
+                })
+        candidates = candidates[:10]
+
+        if candidates:
+            emit(
+                f"🛡️ 確認漏れ防止チェック: 最終リストにない候補 {len(candidates)}件を追加判定中..."
+            )
+            # e-Gov で実在確認と law_id 取得（ヒットは情報源リストにも加える）
+            seen_titles = {r.get("title", "") for r in search_results}
+            for c in candidates:
+                try:
+                    hits = search_laws_by_keyword(c["law_name"], max_results=3)
+                except Exception:
+                    hits = []
+                hit = next(
+                    (h for h in hits if _is_law_name_match(c["law_name"], h.get("title", ""))),
+                    None,
+                )
+                if hit:
+                    c["law_id"]          = hit.get("law_id", "")
+                    c["law_revision_id"] = hit.get("law_revision_id", "")
+                    if hit.get("title") and hit["title"] not in seen_titles:
+                        seen_titles.add(hit["title"])
+                        search_results.append(hit)
+
+            supp_llm = _llm().with_structured_output(SupplementalResult)
+            cand_str = "\n".join(
+                f"- {c['law_name']}（出所: {c['origin']}）\n  経緯・理由: {c['reason']}"
+                for c in candidates
+            )
+            supp: SupplementalResult = supp_llm.invoke([
+                SystemMessage(SUPPLEMENTAL_LAW_SYSTEM),
+                HumanMessage(
+                    f"## 設備情報\n{json.dumps(equipment_info, ensure_ascii=False, indent=2)}\n\n"
+                    f"## 追加判定候補の法令（全件判定すること）\n{cand_str}"
+                ),
+            ])
+            judgments = list(supp.judgments)
+
+            n_check = n_excl = 0
+            for c in candidates:
+                j = next(
+                    (v for v in judgments if _is_law_name_match(c["law_name"], v.law_name)),
+                    None,
+                )
+                # 判定が返らなかった候補は安全側（要確認）に倒す
+                verdict = j.verdict if j else "check"
+                reason  = j.reason if j else "自動判定を取得できなかったため、安全側で要確認としています"
+                if verdict == "excluded":
+                    n_excl += 1
+                    excluded_laws.append({
+                        "law_name": c["law_name"],
+                        "reason":   f"（確認漏れ防止チェックでの追加判定）{reason}",
+                    })
+                    continue
+                n_check += 1
+                law_items.append({
+                    "law_name": c["law_name"],
+                    "applicability": (
+                        f"🛡️ 確認漏れ防止チェックによる自動追加（{c['origin']}）。{reason}"
+                    ),
+                    "priority":          "check",
+                    "relevant_articles": [],
+                    "deliveries":        [],
+                    "internal_actions":  [{
+                        "item":        "本法令の適用要否の確認（仕様・数量等の確定後に判定）",
+                        "responsible": "設備導入担当者",
+                        "deadline":    "稼働前",
+                    }],
+                    "law_id":            c.get("law_id", ""),
+                    "law_revision_id":   c.get("law_revision_id", ""),
+                })
+            emit(
+                f"🛡️ 確認漏れ防止チェック完了: 要確認 {n_check}件を追加・"
+                f"非該当 {n_excl}件を判定しました"
+            )
+    except Exception:
+        # 自己修復の失敗で調査全体を落とさない（レポート側の突合チェックが最後の砦になる）
+        emit("⚠️ 確認漏れ防止チェックの自動判定に失敗しました（レポートの突合チェックで確認してください）")
+
+    # e-Gov の law_id / law_revision_id を法令名で逆引きして付与
     title_to_ids: dict[str, dict] = {}
     for r in search_results:
         t = r.get("title", "")
@@ -1248,13 +1383,22 @@ def synthesis_node(state: AppState) -> dict:
     # 届出先の出典ID（[R◯]）を実在する検索結果のURL・タイトルに解決
     _attach_delivery_sources(law_items, search_results)
 
+    # 優先度別件数は、要確認への昇格・確認漏れ防止チェックの追加分を含む
+    # 最終的な law_items から再集計する（LLM出力の件数は加工前の値のためズレる）
+    risk_count = {
+        p: sum(1 for l in law_items if l.get("priority", "check") == p)
+        for p in ("required", "check", "pending")
+    }
+
     return {
         "law_items":         law_items,
         "synthesis_summary": result.summary,
-        "risk_count":        result.risk_count.model_dump(),
+        "risk_count":        risk_count,
         # LLM生出力ではなく、情報不足の非該当を「要確認」へ昇格させた後の
         # 選別済みリストを返す（生出力を返すと要確認と非該当に二重掲載される）
         "excluded_laws":     excluded_laws,
+        # 確認漏れ防止チェックで追加取得した e-Gov ヒットを含む
+        "search_results":    search_results,
         "prefetch_cache":    {"law_ids": egov_law_ids, "excerpts": article_excerpts},
         "phase":             "results_review",
     }
