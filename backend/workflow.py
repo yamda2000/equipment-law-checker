@@ -9,6 +9,7 @@ import os
 import re
 import json
 import uuid
+import logging
 import datetime
 from typing import Literal
 
@@ -32,6 +33,7 @@ from backend.prompts import (
 from backend.tools.egov import (
     search_laws_by_keyword, fetch_article_list, fetch_article_text,
     normalize_article_ref, get_suggested_keywords, resolve_law_alias,
+    EgovAPIError,
 )
 from backend.tools.web_search import search_web
 from backend.tools.internal_docs import search_internal_docs, internal_docs_available
@@ -39,6 +41,8 @@ from backend.rag_agent import agentic_internal_search
 from backend.case_memory import save_case, find_similar_cases, format_cases_for_prompt
 from backend.fields import FIELD_JA as HEARING_FIELD_JA
 from backend.report_gen import generate_html_report
+
+logger = logging.getLogger(__name__)
 
 
 # ─── LLM ファクトリ ───────────────────────────────────────────────
@@ -484,6 +488,12 @@ def _process_web_results(
         entry = f"⚠️ [{label}] 「{query}」→ エラー: {err_msg}"
         return entry, 0
 
+    # Web検索未設定（GEMINI_API_KEY なし）のプレースホルダーは実結果として
+    # 扱わない（網羅性チェック・統合LLMの根拠に混入させない）
+    if any(r.get("source") == "unavailable" for r in web_results):
+        entry = f"⚠️ [{label}] 「{query}」→ Web検索は未実行（GEMINI_API_KEY未設定・未確認）"
+        return entry, 0
+
     added = 0
     for r in web_results:
         # 検索候補（searchEntryPoint）は検索結果とは分離して保持する。
@@ -538,6 +548,9 @@ def search_node(state: AppState) -> dict:
     emit("🔎 法令調査を開始します（e-Gov 法令API ＋ Web検索）...")
 
     search_count = 0  # 実際に検索を実行した回数（スキップは含めない）
+    # e-Gov APIエラーで結果を取得できなかった検索の件数。
+    # 「0件ヒット」と「未確認」を混同すると確認漏れになるため、担当者に明示する
+    egov_api_errors = 0
     is_reinvestigation = bool(prev_results)
 
     if is_reinvestigation:
@@ -555,7 +568,14 @@ def search_node(state: AppState) -> dict:
             f"（AI分析 {len(initial_keywords)}件＋ルールベース必須法令 {len(baseline_keywords)}件）"
         )
         for kw in seed_keywords:
-            laws = search_laws_by_keyword(kw, max_results=4)
+            kw_failed = False
+            try:
+                laws = search_laws_by_keyword(kw, max_results=4)
+            except EgovAPIError as e:
+                laws = []
+                kw_failed = True
+                egov_api_errors += 1
+                logger.warning("e-Gov シード検索エラー: %s", e)
             executed_queries.add(kw)
             search_count += 1
             added = 0
@@ -565,7 +585,10 @@ def search_node(state: AppState) -> dict:
                     seen_titles.add(title)
                     results.append(law)
                     added += 1
-            entry = f"🔍 [e-Gov] 「{kw}」→ {added}件取得"
+            entry = (
+                f"⚠️ [e-Gov] 「{kw}」→ APIエラーで取得失敗（0件は「該当なし」ではなく未確認）"
+                if kw_failed else f"🔍 [e-Gov] 「{kw}」→ {added}件取得"
+            )
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
             emit(entry)
@@ -688,11 +711,26 @@ def search_node(state: AppState) -> dict:
             HumanMessage(context),
         ])
 
-        if action.done or not action.query:
+        if action.done:
             done_entry = f"✅ 調査完了（{decision_count}回の判断で収集十分と判断しました）"
             progress_messages.append(AIMessage(content=done_entry, name="search_progress"))
             emit(done_entry)
             break
+
+        # done=False なのにクエリが空 → LLM出力のフォーマット崩れ。
+        # 「調査完了」と混同せず、スキップ扱いにして再判断させる
+        if not action.query:
+            consecutive_skips += 1
+            skip_entry = "⏭️ スキップ（追加検索クエリが提示されませんでした。再判断します）"
+            search_log.append(skip_entry)
+            progress_messages.append(AIMessage(content=skip_entry, name="search_progress"))
+            emit(skip_entry)
+            if consecutive_skips >= 3:
+                done_entry = "✅ 調査完了（新規クエリの提案がなくなったため終了します）"
+                progress_messages.append(AIMessage(content=done_entry, name="search_progress"))
+                emit(done_entry)
+                break
+            continue
 
         # 検索済みクエリの再提案はAPIを呼ばずスキップ（検索回数は消費しない）
         if action.query in executed_queries:
@@ -732,7 +770,14 @@ def search_node(state: AppState) -> dict:
             emit(f"📚 e-Gov 法令API で追加検索中:「{action.query}」")
             # 1クエリの取得は3件（本法＋施行令＋施行規則で通常足りる。
             # 5件だと周辺法令のノイズが増えて上限を圧迫するため）
-            laws = search_laws_by_keyword(action.query, max_results=3)
+            kw_failed = False
+            try:
+                laws = search_laws_by_keyword(action.query, max_results=3)
+            except EgovAPIError as e:
+                laws = []
+                kw_failed = True
+                egov_api_errors += 1
+                logger.warning("e-Gov 追加検索エラー: %s", e)
             search_count += 1
             added = 0
             for law in laws:
@@ -741,7 +786,10 @@ def search_node(state: AppState) -> dict:
                     seen_titles.add(title)
                     results.append(law)
                     added += 1
-            entry = f"🔍 [e-Gov API] 「{action.query}」→ {added}件新規取得"
+            entry = (
+                f"⚠️ [e-Gov API] 「{action.query}」→ APIエラーで取得失敗（未確認）"
+                if kw_failed else f"🔍 [e-Gov API] 「{action.query}」→ {added}件新規取得"
+            )
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
             emit(entry)
@@ -784,6 +832,9 @@ def search_node(state: AppState) -> dict:
     # 論点 → カバー元の法令・情報タイトル（レポート・結果確認でカバー判定の
     # 妥当性を人が検証できるようにする）
     issue_coverage: dict = {}
+    # 網羅性チェック自体が実行できなかった場合の明示フラグ。
+    # チェック失敗を「未カバーなし＝OK」と混同すると偽の✅表示になるため区別する
+    coverage_check_failed = False
     if issues:
         emit("🧮 論点ごとの網羅性を検証中...")
         coverage_llm = _llm().with_structured_output(CoverageCheck)
@@ -802,9 +853,19 @@ def search_node(state: AppState) -> dict:
                     ),
                 ])
             except Exception:
+                logger.warning("網羅性チェックのLLM呼び出しに失敗", exc_info=True)
                 return None
 
         check = _run_coverage_check()
+        if check is None:
+            coverage_check_failed = True
+            warn = (
+                "⚠️ 網羅性チェックを実行できませんでした（AI呼び出しエラー）。"
+                "論点のカバー状況は自動確認できていないため、結果確認画面で手動確認してください。"
+            )
+            search_log.append(warn)
+            progress_messages.append(AIMessage(content=warn, name="search_progress"))
+            emit(warn)
         uncovered = check.uncovered if check else []
         if uncovered:
             emit(f"⚠️ 未カバーの論点が{len(uncovered)}件。全件を補完検索します...")
@@ -817,7 +878,14 @@ def search_node(state: AppState) -> dict:
                 search_count += 1
                 if u.search_type == "egov":
                     emit(f"📚 [網羅性補完] e-Gov検索:「{q}」")
-                    laws = search_laws_by_keyword(q, max_results=5)
+                    kw_failed = False
+                    try:
+                        laws = search_laws_by_keyword(q, max_results=5)
+                    except EgovAPIError as e:
+                        laws = []
+                        kw_failed = True
+                        egov_api_errors += 1
+                        logger.warning("e-Gov 網羅性補完検索エラー: %s", e)
                     added = 0
                     for law in laws:
                         title = law.get("title", "")
@@ -825,7 +893,10 @@ def search_node(state: AppState) -> dict:
                             seen_titles.add(title)
                             results.append(law)
                             added += 1
-                    entry = f"🔍 [網羅性補完] 「{q}」→ {added}件取得"
+                    entry = (
+                        f"⚠️ [網羅性補完] 「{q}」→ APIエラーで取得失敗（未確認）"
+                        if kw_failed else f"🔍 [網羅性補完] 「{q}」→ {added}件取得"
+                    )
                 elif u.search_type == "internal":
                     emit(f"📁 [網羅性補完] AIエージェントが社内文書を調査:「{q}」")
                     internal_hits = agentic_internal_search(
@@ -850,18 +921,30 @@ def search_node(state: AppState) -> dict:
 
             # 補完後に再チェックし、それでも未カバーの論点を記録する
             recheck = _run_coverage_check()
-            check = recheck or check
-            uncovered_issues = [u.issue for u in recheck.uncovered] if recheck else []
-            if uncovered_issues:
+            if recheck is None:
+                # 再チェック不能時は「カバーされた」とは判断せず、
+                # 補完前に未カバーだった論点を安全側でそのまま残す
+                coverage_check_failed = True
+                uncovered_issues = [u.issue for u in uncovered]
                 warn = (
-                    f"⚠️ 補完検索後も{len(uncovered_issues)}件の論点は対応情報が"
-                    f"見つかりませんでした。結果確認画面・レポートに明示します。"
+                    "⚠️ 補完検索後の網羅性再チェックを実行できませんでした（AI呼び出しエラー）。"
+                    "補完前に未カバーだった論点を要確認として表示します。"
                 )
                 progress_messages.append(AIMessage(content=warn, name="search_progress"))
                 emit(warn)
             else:
-                emit("✅ 補完検索により全論点がカバーされました")
-        else:
+                check = recheck
+                uncovered_issues = [u.issue for u in recheck.uncovered]
+                if uncovered_issues:
+                    warn = (
+                        f"⚠️ 補完検索後も{len(uncovered_issues)}件の論点は対応情報が"
+                        f"見つかりませんでした。結果確認画面・レポートに明示します。"
+                    )
+                    progress_messages.append(AIMessage(content=warn, name="search_progress"))
+                    emit(warn)
+                else:
+                    emit("✅ 補完検索により全論点がカバーされました")
+        elif check is not None:
             emit("✅ 全論点に対応する情報が収集されています")
 
         # 最終チェック結果からカバー元マップを構築（入力論点の原文表記のみ採用）
@@ -895,28 +978,49 @@ def search_node(state: AppState) -> dict:
         egov_res     = [r for r in rest if _src(r) == "egov"]
         web_res      = [r for r in rest if _src(r) == "web"]
 
-        web_quota = min(
-            len(web_res),
-            max(WEB_MIN_KEEP, budget - len(internal_res) - len(egov_res)),
-        )
-        egov_quota = max(0, budget - len(internal_res) - web_quota)
+        # クォータの合計が budget を超えないよう先に確定させる
+        # （従来は internal を無制限に連結してから全体をスライスしていたため、
+        # 社内文書が多いと「Web最低15件」の保証が最終スライスで破られていた）
+        internal_quota = min(len(internal_res), budget)
+        rem = budget - internal_quota
+        web_quota  = min(len(web_res), max(min(WEB_MIN_KEEP, rem), rem - len(egov_res)))
+        egov_quota = min(len(egov_res), rem - web_quota)
 
-        dropped_egov = max(0, len(egov_res) - egov_quota)
-        dropped_web  = max(0, len(web_res) - web_quota)
+        dropped_internal = len(internal_res) - internal_quota
+        dropped_egov     = len(egov_res) - egov_quota
+        dropped_web      = len(web_res) - web_quota
         if dropped_egov:
             # ルールベース必須法令・AI分析キーワード由来の法令を優先して残す
             prio = set(initial_keywords) | set(get_suggested_keywords(equipment_info))
             egov_res = sorted(
                 egov_res, key=lambda r: 0 if r.get("keyword", "") in prio else 1
-            )[:egov_quota]
+            )
         results = (
-            protected_res + internal_res + egov_res + web_res[:web_quota]
-        )[:MAX_SEARCH_RESULTS]
+            protected_res + internal_res[:internal_quota]
+            + egov_res[:egov_quota] + web_res[:web_quota]
+        )
+        dropped_str = "・".join(
+            s for s in (
+                f"e-Gov {dropped_egov}件" if dropped_egov else "",
+                f"Web {dropped_web}件" if dropped_web else "",
+                f"社内文書 {dropped_internal}件" if dropped_internal else "",
+            ) if s
+        )
         warn = (
             f"⚠️ 収集件数が上限{MAX_SEARCH_RESULTS}件を超えたため、"
-            f"e-Gov {dropped_egov}件・Web {dropped_web}件を割愛しました"
-            f"（必須法令・社内文書・網羅性補完の取得分・Web最低{WEB_MIN_KEEP}件枠を優先保持）"
+            f"{dropped_str}を割愛しました"
+            f"（必須法令・網羅性補完の取得分・Web最低{WEB_MIN_KEEP}件枠を優先保持）"
         )
+        progress_messages.append(AIMessage(content=warn, name="search_progress"))
+        emit(warn)
+
+    if egov_api_errors:
+        warn = (
+            f"⚠️ e-Gov APIエラーが{egov_api_errors}件発生しました。"
+            f"該当キーワードの法令検索結果は未取得（「該当なし」ではなく未確認）のため、"
+            f"確認漏れの可能性があります。再調査を推奨します。"
+        )
+        search_log.append(warn)
         progress_messages.append(AIMessage(content=warn, name="search_progress"))
         emit(warn)
 
@@ -938,6 +1042,7 @@ def search_node(state: AppState) -> dict:
         "executed_queries": sorted(executed_queries),
         "uncovered_issues": uncovered_issues,
         "issue_coverage":   issue_coverage,
+        "coverage_check_failed": coverage_check_failed,
         "search_suggestions": search_suggestions,
         "phase":            "synthesizing",
         "messages":         progress_messages,
@@ -992,6 +1097,8 @@ def _ground_relevant_articles(law_items: list) -> None:
                 p for p in dict.fromkeys(picked) if p in valid_refs
             ][:5]
         except Exception:
+            logger.warning("条番号照合のLLM呼び出しに失敗 '%s'", law_name, exc_info=True)
+            emit(f"⚠️ 「{law_name}」の条番号照合に失敗しました。条番号は未確定（確認中）と表示されます")
             law["relevant_articles"] = []
 
         # deliveries.law_article も実在検証（「第◯条第◯項」は条部分で照合）
@@ -1063,6 +1170,8 @@ def _prefetch_article_excerpts(
                 ),
             ])
         except Exception:
+            logger.warning("条文選定のLLM呼び出しに失敗 '%s'", title, exc_info=True)
+            emit(f"⚠️ 「{title}」の条文選定に失敗しました。この法令は条文根拠なしで判定されます")
             continue
 
         valid_refs = {a["ref"] for a in article_list}
@@ -1075,6 +1184,8 @@ def _prefetch_article_excerpts(
         try:
             texts = fetch_article_text(law["law_id"], refs, law.get("law_revision_id", ""))
         except Exception:
+            logger.warning("条文本文の取得に失敗 '%s'", title, exc_info=True)
+            emit(f"⚠️ 「{title}」の条文本文を取得できませんでした。この法令は条文根拠なしで判定されます")
             texts = {}
         lines = [f"### {title}"]
         for ref in refs:
@@ -1264,7 +1375,12 @@ def synthesis_node(state: AppState) -> dict:
             for c in candidates:
                 try:
                     hits = search_laws_by_keyword(c["law_name"], max_results=3)
+                except EgovAPIError as e:
+                    emit(f"⚠️ 「{c['law_name']}」の実在確認がe-Gov APIエラーで未完了")
+                    logger.warning("確認漏れ防止チェックの e-Gov 検索エラー: %s", e)
+                    hits = []
                 except Exception:
+                    logger.warning("確認漏れ防止チェックの検索で予期しないエラー", exc_info=True)
                     hits = []
                 hit = next(
                     (h for h in hits if _is_law_name_match(c["law_name"], h.get("title", ""))),
@@ -1368,7 +1484,12 @@ def synthesis_node(state: AppState) -> dict:
         if not law.get("law_id"):
             law_name = law.get("law_name", "")
             if law_name:
-                hits = search_laws_by_keyword(law_name, max_results=3)
+                try:
+                    hits = search_laws_by_keyword(law_name, max_results=3)
+                except EgovAPIError as e:
+                    # law_id 未解決のままにする（表示側は「条番号確認中」になる）
+                    logger.warning("law_id 補完検索エラー: %s", e)
+                    hits = []
                 hit = next(
                     (h for h in hits if _is_law_name_match(law_name, h.get("title", ""))),
                     None,
@@ -1418,6 +1539,7 @@ def results_review_node(state: AppState) -> dict:
         "uncovered_issues": state.get("uncovered_issues", []),
         "issues":           state.get("issues", []),   # 網羅性チェック表示用
         "issue_coverage":   state.get("issue_coverage", {}),  # カバー元の法令表示用
+        "coverage_check_failed": state.get("coverage_check_failed", False),
     })
 
     # 「足りない・再調査して」依頼なら検索フェーズに戻す
@@ -1436,7 +1558,7 @@ def results_review_node(state: AppState) -> dict:
 
     # 通常: レポートへ。case_id をここで確定し、以降の再実行でも不変にする
     case_id = state.get("case_id") or (
-        f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
+        f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
     )
     return {
         "messages": [AIMessage("レビュー完了。レポートを生成します。")],
@@ -1483,7 +1605,7 @@ def report_node(state: AppState) -> dict:
     """HTML レポートを生成。interrupt でレポートレビューを要求。
     再開時の依頼に応じて 再調査(search へ) / 文面修正(report 再実行) / 承認(complete) に分岐する。"""
     case_id = state.get("case_id") or (
-        f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
+        f"EQ-{datetime.datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
     )
     report_html = generate_html_report(
         equipment_info=state.get("equipment_info", {}),
@@ -1496,6 +1618,7 @@ def report_node(state: AppState) -> dict:
         summary=state.get("synthesis_summary", ""),
         issues=state.get("issues", []),
         issue_coverage=state.get("issue_coverage", {}),
+        coverage_check_failed=state.get("coverage_check_failed", False),
     )
 
     # Human in the loop: レポートレビュー

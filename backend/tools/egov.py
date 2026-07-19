@@ -5,10 +5,22 @@ API仕様: https://laws.e-gov.go.jp/api/2/swagger-ui
 
 import re
 import base64
+import logging
 import requests
 from xml.etree import ElementTree as ET
 
+logger = logging.getLogger(__name__)
+
 EGOV_BASE_V2 = "https://laws.e-gov.go.jp/api/2"
+
+
+class EgovAPIError(RuntimeError):
+    """e-Gov API 呼び出しの失敗。
+
+    「検索したが該当法令が0件だった」と「APIエラーで結果を取得できなかった」を
+    呼び出し側が区別できるようにするための例外。法令確認ツールでは後者を
+    空リストとして扱うと確認漏れ（偽陰性）につながるため、必ず区別する。
+    """
 
 _SESSION = requests.Session()
 _SESSION.headers.update({
@@ -62,16 +74,21 @@ def _extract_law_name_candidates(keyword: str) -> list[str]:
 
 
 def search_laws_by_keyword(keyword: str, max_results: int = 5) -> list[dict]:
-    # 通称・略称を正式名称に変換
-    keyword = _LAW_ALIAS.get(keyword, keyword)
-
     """
     キーワードで法令を検索する。
     1. law_title 検索: キーワードそのまま → ヒットなければ法令名候補に分解してリトライ
     2. keyword 全文検索: 残件数を補完
+
+    APIエラーで1件も取得できなかった場合は EgovAPIError を送出する
+    （「該当法令なし」の空リストとは区別する）。一部の検索だけ失敗した
+    場合は取得できた分を返す。
     """
+    # 通称・略称を正式名称に変換
+    keyword = _LAW_ALIAS.get(keyword, keyword)
+
     results = []
     seen_ids: set[str] = set()
+    api_errors: list[str] = []
 
     def _add(hits: list[dict]) -> None:
         for law in hits:
@@ -80,15 +97,22 @@ def search_laws_by_keyword(keyword: str, max_results: int = 5) -> list[dict]:
                 seen_ids.add(law_id)
                 results.append(law)
 
+    def _safe(search_fn, query: str, limit: int) -> list[dict]:
+        try:
+            return search_fn(query, limit)
+        except EgovAPIError as e:
+            api_errors.append(str(e))
+            return []
+
     # ── 法令名検索（law_title）──────────────────────────────────────
-    _add(_search_by_title(keyword, max_results))
+    _add(_safe(_search_by_title, keyword, max_results))
 
     # ヒットなし かつ スペース含む → 法令名候補に分解してリトライ
     if not results and " " in keyword:
         for candidate in _extract_law_name_candidates(keyword):
             if candidate == keyword:
                 continue
-            _add(_search_by_title(candidate, max_results))
+            _add(_safe(_search_by_title, candidate, max_results))
             if results:
                 break  # 最初にヒットした候補で打ち止め
 
@@ -96,7 +120,13 @@ def search_laws_by_keyword(keyword: str, max_results: int = 5) -> list[dict]:
     if len(results) < max_results:
         # スペース含む複合クエリは先頭の法令名候補だけで全文検索（ノイズ軽減）
         fulltext_query = _extract_law_name_candidates(keyword)[0] if " " in keyword else keyword
-        _add(_search_by_fulltext(fulltext_query, (max_results - len(results)) * 2))
+        _add(_safe(_search_by_fulltext, fulltext_query, (max_results - len(results)) * 2))
+
+    if not results and api_errors:
+        raise EgovAPIError(
+            f"e-Gov APIエラーのため「{keyword}」の検索結果を取得できませんでした"
+            f"（{api_errors[0]}）"
+        )
 
     return results[:max_results]
 
@@ -137,8 +167,8 @@ def _search_by_title(keyword: str, max_results: int) -> list[dict]:
         data = resp.json()
         return [_parse_law(law, keyword) for law in data.get("laws", [])]
     except Exception as e:
-        print(f"[e-Gov title search ERROR] '{keyword}': {e}")
-        return []
+        logger.warning("e-Gov 法令名検索に失敗 '%s': %s", keyword, e)
+        raise EgovAPIError(f"法令名検索 '{keyword}': {e}") from e
 
 
 def _search_by_fulltext(keyword: str, max_results: int) -> list[dict]:
@@ -155,8 +185,8 @@ def _search_by_fulltext(keyword: str, max_results: int) -> list[dict]:
         data = resp.json()
         return [_parse_law(item, keyword) for item in data.get("items", [])]
     except Exception as e:
-        print(f"[e-Gov fulltext search ERROR] '{keyword}': {e}")
-        return []
+        logger.warning("e-Gov 全文検索に失敗 '%s': %s", keyword, e)
+        raise EgovAPIError(f"全文検索 '{keyword}': {e}") from e
 
 
 # ─── ルールベース法令チェックリスト（決定的ベースライン） ─────────
@@ -244,12 +274,15 @@ def get_suggested_keywords(equipment_info: dict) -> list[str]:
 
 # 法令XMLのインメモリキャッシュ（law_id → XML文字列）
 _LAW_XML_CACHE: dict[str, str] = {}
+# 法令XMLは1件数百KB〜数MBになるため、キャッシュは件数上限を設けて
+# 長期稼働プロセスのメモリ増加を防ぐ（超過時は古いものから削除）
+_LAW_XML_CACHE_MAX = 64
 
 
 def _get_law_xml(law_id: str, law_revision_id: str = "") -> str:
     """e-Gov API から法令XML文字列を取得する（キャッシュ付き）。失敗時は空文字。
     /law_data/{id} は law_full_text_format=xml 指定時、Base64エンコードされた
-    XML文字列を返す。"""
+    XML文字列を返す。API障害と「未収載（404）」はログ上で区別する。"""
     cache_key = law_revision_id or law_id
     xml_str = _LAW_XML_CACHE.get(cache_key)
     if xml_str:
@@ -270,6 +303,8 @@ def _get_law_xml(law_id: str, law_revision_id: str = "") -> str:
                 timeout=20,
             )
             if resp.status_code == 404:
+                # 条例など e-Gov 未収載の法令。障害ではないため debug に留める
+                logger.debug("e-Gov 法令XML未収載 (404): %s", try_id)
                 continue
             resp.raise_for_status()
             raw = resp.json().get("law_full_text", "")
@@ -279,9 +314,14 @@ def _get_law_xml(law_id: str, law_revision_id: str = "") -> str:
                 else:
                     xml_str = base64.b64decode(raw).decode("utf-8")
             if xml_str:
+                if len(_LAW_XML_CACHE) >= _LAW_XML_CACHE_MAX:
+                    _LAW_XML_CACHE.pop(next(iter(_LAW_XML_CACHE)))
                 _LAW_XML_CACHE[cache_key] = xml_str
                 return xml_str
-        except Exception:
+        except Exception as e:
+            # API障害・応答破損。「未収載」と区別してログに残す
+            # （呼び出し側は空文字を「原文照合不可」として扱う）
+            logger.warning("e-Gov 法令XML取得に失敗 '%s': %s", try_id, e)
             continue
     return ""
 

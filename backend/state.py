@@ -36,6 +36,9 @@ class AppState(TypedDict):
     search_suggestions: list
     # 網羅性検証で「対応情報が見つからない」と判定された論点（担当者に明示）
     uncovered_issues: list
+    # 網羅性検証そのものが実行できなかった場合の明示フラグ
+    # （チェック失敗を「未カバーなし＝OK」と混同して偽の✅を出さないため）
+    coverage_check_failed: bool
     # 網羅性検証のカバー元マップ {論点: [カバーする法令・情報タイトル, ...]}
     # （カバー判定の妥当性を人が検証できるようレポート・結果確認に表示する）
     issue_coverage: dict

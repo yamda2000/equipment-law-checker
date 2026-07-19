@@ -173,18 +173,58 @@ def _relocate_refrigerant(data: dict) -> dict:
     return data
 
 
-def extract_equipment_info(doc_texts: list, config: dict | None = None) -> dict:
+def _fit_doc_texts(doc_texts: list, cap: int) -> tuple[list, list]:
+    """各資料に文字数上限を配分し、(採用リスト, 切り捨て情報) を返す。
+
+    従来の「連結後に先頭 cap 字」方式では、1件目の大きな資料だけで上限を
+    使い切ると2件目以降が1文字もLLMへ渡らず、無通知の確認漏れになる。
+    短い資料の未使用分を長い資料へ再配分しつつ、全資料に必ず枠を与える。
+    """
+    n = len(doc_texts)
+    if n == 0:
+        return [], []
+    remaining = cap
+    # 長さ昇順に配分すると、短い資料の余剰が自動的に長い資料へ回る
+    order = sorted(range(n), key=lambda i: len(doc_texts[i][1]))
+    alloc = [0] * n
+    left = n
+    for i in order:
+        share = remaining // left
+        alloc[i] = min(len(doc_texts[i][1]), share)
+        remaining -= alloc[i]
+        left -= 1
+    fitted, truncated = [], []
+    for i, (name, text) in enumerate(doc_texts):
+        fitted.append((name, text[:alloc[i]]))
+        if len(text) > alloc[i]:
+            truncated.append(
+                {"name": name, "used": alloc[i], "total": len(text)}
+            )
+    return fitted, truncated
+
+
+def extract_equipment_info(
+    doc_texts: list, config: dict | None = None
+) -> tuple[dict, list]:
     """[(ファイル名, 抽出テキスト), ...] からヒアリング11項目を構造化抽出する。
 
     config: LLM 呼び出しに渡す RunnableConfig（Langfuse の callbacks 等）。
-    返り値: {フィールド名: {"value": str, "evidence": str}}
+    返り値: ({フィールド名: {"value": str, "evidence": str}},
+             切り捨て情報 [{"name", "used", "total"}, ...])
     抽出に失敗した場合は例外を送出する（呼び出し側でフォールバック）。
     """
     from backend.workflow import _llm  # 循環importを避けるため遅延import
 
+    fitted, truncated = _fit_doc_texts(doc_texts, MAX_TEXT_CHARS)
+    if truncated:
+        logger.warning(
+            "資料テキストが上限 %d 字を超過。切り捨て: %s",
+            MAX_TEXT_CHARS,
+            [(t["name"], f'{t["used"]}/{t["total"]}字') for t in truncated],
+        )
     combined = "\n\n".join(
-        f"===== 資料: {name} =====\n{text}" for name, text in doc_texts
-    )[:MAX_TEXT_CHARS]
+        f"===== 資料: {name} =====\n{text}" for name, text in fitted
+    )
 
     llm = _llm().with_structured_output(DocExtraction)
     result: DocExtraction = llm.invoke([
@@ -193,4 +233,4 @@ def extract_equipment_info(doc_texts: list, config: dict | None = None) -> dict:
     ], config=config or {})
     return _relocate_refrigerant(
         {name: field.model_dump() for name, field in result}
-    )
+    ), truncated

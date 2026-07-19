@@ -155,14 +155,19 @@ def _sanitize_query(query: str) -> str:
 
 
 def _stub_results(query: str) -> list[dict]:
-    """GEMINI_API_KEY 未設定時のスタブ結果"""
+    """GEMINI_API_KEY 未設定時の明示的な「未実行」結果。
+
+    検索結果として扱ってはならない（実結果と混同すると、網羅性チェックが
+    このプレースホルダーを根拠に論点カバー済みと誤判定する）。呼び出し側は
+    source == "unavailable" を実結果から除外し、未実行として表示すること。
+    """
     return [
         {
-            "source": "stub",
-            "title": f"[未設定] {query} に関する情報",
-            "url": "https://laws.e-gov.go.jp/",
-            "snippet": "GEMINI_API_KEY を .env に設定するとWeb検索が有効になります。"
-                       "現在は e-Gov API の結果のみを使用しています。",
+            "source": "unavailable",
+            "title": f"[Web検索未実行] {query}",
+            "url": "",
+            "snippet": "GEMINI_API_KEY が未設定のためWeb検索は実行されていません。"
+                       "この論点のWeb情報（条例・届出先等）は未確認です。",
             "query": query,
         }
     ]

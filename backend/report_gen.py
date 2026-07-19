@@ -93,10 +93,11 @@ def generate_html_report(
     summary: str = "",
     issues: list = None,
     issue_coverage: dict = None,
+    coverage_check_failed: bool = False,
 ) -> str:
     """法令別アクションアイテムから HTML レポートを生成する"""
     now = datetime.now()
-    case_id = case_id or f"EQ-{now.strftime('%Y%m%d')}-{str(uuid.uuid4())[:4].upper()}"
+    case_id = case_id or f"EQ-{now.strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
 
     feedback_html = (
         f'<div style="background:#E3F2FD;border-left:4px solid #1565C0;padding:14px 18px;'
@@ -114,7 +115,8 @@ def generate_html_report(
     unknown_html   = _build_unknown_items(unknown_items)
     law_refs       = _build_law_refs(search_results)
     uncovered_html = _build_coverage_check(
-        issues or [], uncovered_issues or [], issue_coverage or {}
+        issues or [], uncovered_issues or [], issue_coverage or {},
+        check_failed=coverage_check_failed,
     )
     matrix_html    = _build_law_matrix(law_items, excluded_laws or [], equipment_info)
 
@@ -358,7 +360,13 @@ _CHECKLIST_SCRIPT = """<script>
 
   var btn = document.getElementById('cl-csv-btn');
   if (btn) btn.addEventListener('click', function () {
-    var esc = function (v) { return '"' + String(v || '').replace(/"/g, '""') + '"'; };
+    var esc = function (v) {
+      var s = String(v || '');
+      // Excel数式インジェクション対策: = + - @ やタブ等で始まるセルは
+      // 先頭に ' を付けて数式として評価されないようにする
+      if (/^[=+\-@\t\r]/.test(s.trim())) { s = "'" + s; }
+      return '"' + s.replace(/"/g, '""') + '"';
+    };
     var lines = [['状態', '時期', '対応事項', '種別', '届出先・担当', '期限', '根拠法令'].map(esc).join(',')];
     items.forEach(function (it) {
       var c = it.cells;
@@ -738,15 +746,47 @@ def _build_law_items(law_items: list) -> str:
     return html
 
 
-def _build_coverage_check(issues: list, uncovered: list, coverage: dict = None) -> str:
+def _build_coverage_check(
+    issues: list, uncovered: list, coverage: dict = None,
+    check_failed: bool = False,
+) -> str:
     """網羅性チェックの結果。論点ごとの✅/⚠️判定を明示し、
     OKの場合も「チェックしてOKだった」ことが分かるように表示する。
-    coverage は {論点: [カバー元の法令・情報タイトル, ...]}（カバー判定の検証用）。"""
-    if not issues and not uncovered:
+    coverage は {論点: [カバー元の法令・情報タイトル, ...]}（カバー判定の検証用）。
+    check_failed=True はチェック自体が実行できなかった状態。OK表示は絶対に出さない。"""
+    if not issues and not uncovered and not check_failed:
         return ""
     coverage = coverage or {}
 
     covered_n = len([i for i in issues if i not in uncovered])
+
+    if check_failed:
+        # チェック未実行：カバー済み/未カバーの区別自体が信頼できないため、
+        # 論点別の✅/⚠️テーブルは出さず、未カバー扱いの論点リストのみ表示する
+        ng_rows = "".join(
+            f'<li style="margin-bottom:6px;line-height:1.6;">{_to_ja_fields(_esc(item))}</li>'
+            for item in uncovered
+        )
+        uncovered_html = (
+            f'<br><strong>下記の論点は補完前の時点で未カバーでした（要確認）：</strong>'
+            f'<ul style="margin:10px 0 0;padding-left:20px;">{ng_rows}</ul>'
+            if uncovered else ""
+        )
+        summary_box = (
+            f'<div style="background:#FFF8E1;border:1px solid #FFE082;border-left:5px solid #F57F17;'
+            f'border-radius:6px;padding:14px 18px;font-size:13px;color:#5D4037;">'
+            f'<strong>⚠️ チェック未完了：</strong>網羅性チェックを完了できませんでした'
+            f'（AI呼び出しエラー）。論点のカバー状況は自動確認されていません。'
+            f'<strong>調査論点 {len(issues)}件のカバー状況を手動で確認してください。</strong>'
+            f'{uncovered_html}</div>'
+        )
+        return (
+            f'<h2 style="color:#F57F17;border-left-color:#F57F17;">🧮 網羅性チェック（調査論点のカバー状況）</h2>'
+            f'<div style="font-size:12px;color:#666;margin-bottom:8px;">'
+            f'調査開始前に洗い出した論点ごとに、対応する法令・情報を収集できたかを'
+            f'AIの調査完了判断とは独立に検証した結果です。</div>'
+            f'{summary_box}'
+        )
 
     # 判定サマリー（OK: 緑 / NG: 赤）
     if issues and not uncovered:

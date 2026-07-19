@@ -6,6 +6,7 @@
 import os
 import re
 import html as html_lib
+import hashlib
 import time
 import uuid
 import sys
@@ -13,7 +14,6 @@ import logging
 import traceback
 import urllib.parse
 import streamlit as st
-import streamlit.components.v1 as components
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -354,7 +354,7 @@ def to_ja_field_names(text: str) -> str:
 
 def _suggestion_html(html: str) -> str:
     """Google 検索候補（searchEntryPoint）の HTML を iframe 表示用に補正する。
-    Google が返すリンクには target 属性がなく、components.html の iframe 内で
+    Google が返すリンクには target 属性がなく、st.iframe の iframe 内で
     遷移しようとして Google 側の X-Frame-Options に拒否され「開かない」ため、
     <base target="_blank"> で全リンクを新しいタブで開かせる。"""
     return '<base target="_blank">' + html
@@ -376,6 +376,7 @@ def init():
         "msg_count":        0,         # 表示済みメッセージ数（重複防止）
         "extracted_info":   None,      # 資料から抽出した設備情報（確認前）
         "extract_failed_files": [],    # テキスト抽出できなかったファイル名
+        "extract_truncated_files": [], # 文字数上限で一部のみ読み取ったファイル情報
         "expected_questions": 11,      # AIが質問する残り項目数（資料確定分だけ減る）
         "api_key_ok":       bool(
             os.getenv("POC_LLM_API_KEY") or os.getenv("PROD_LLM_API_KEY")
@@ -617,6 +618,7 @@ def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
                 "excluded_laws":    get_state_value(tid, "excluded_laws") or [],
                 "uncovered_issues": get_state_value(tid, "uncovered_issues") or [],
                 "issue_coverage":   get_state_value(tid, "issue_coverage") or {},
+                "coverage_check_failed": get_state_value(tid, "coverage_check_failed") or False,
             }
     # 調査で参照した情報源（e-Gov・Web・社内文書のタイトル一覧）
     search_sources = [
@@ -631,7 +633,9 @@ def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
     doc_cache = st.session_state.setdefault("qa_doc_cache", {})
     for f in st.session_state.get("qa_files") or []:
         data = f.getvalue()
-        key = (f.name, len(data))
+        # 同名・同サイズで内容だけ差し替えた場合に古い抽出結果を
+        # 再利用しないよう、内容ハッシュをキーにする
+        key = (f.name, hashlib.sha256(data).hexdigest())
         if key not in doc_cache:
             try:
                 doc_cache[key] = extract_text_from_file(f.name, data)
@@ -901,7 +905,7 @@ def start_with_documents(files) -> bool:
     """アップロード資料からテキストを抽出し、LLMで11項目を構造化抽出して
     確認画面（confirm_extract）へ進む。1件も抽出できなければ False を返す
     （呼び出し側で通常ヒアリングにフォールバックする）。"""
-    doc_texts, failed = [], []
+    doc_texts, failed, truncated = [], [], []
     extracted = None
     with st.spinner("📄 資料から設備情報を抽出中...（資料が多いと1分程度かかります）"):
         for f in files:
@@ -918,13 +922,14 @@ def start_with_documents(files) -> bool:
                     input=[name for name, _t in doc_texts],
                 ) as lf:
                     try:
-                        extracted = extract_equipment_info(doc_texts, config=lf)
+                        extracted, truncated = extract_equipment_info(doc_texts, config=lf)
                     finally:
                         _record_llm_usage(cb)
             except Exception:
                 logger.error("資料からの情報抽出でエラー:\n%s", traceback.format_exc())
 
     st.session_state.extract_failed_files = failed
+    st.session_state.extract_truncated_files = truncated
     if extracted:
         st.session_state.extracted_info = extracted
         st.session_state.ui_phase = "confirm_extract"
@@ -940,6 +945,16 @@ def render_extract_confirm():
         st.warning(
             "⚠️ 次のファイルはテキストを抽出できませんでした（スキャン画像のPDF等）："
             + "、".join(failed)
+        )
+    truncated = st.session_state.get("extract_truncated_files") or []
+    if truncated:
+        st.warning(
+            "⚠️ 文字数上限のため、次のファイルは一部のみ読み取りました。"
+            "後半に記載の情報（数量・容量等）が抽出されていない可能性があるため、"
+            "下記の内容をご確認ください："
+            + "、".join(
+                f'{t["name"]}（{t["used"]:,}/{t["total"]:,}字）' for t in truncated
+            )
         )
 
     filled_count = sum(
@@ -1089,10 +1104,9 @@ def resume_graph(decision):
                 finally:
                     # エラー時も、そこまでに消費したトークンを計上する
                     _record_llm_usage(cb)
-        except Exception as e:
+        except Exception:
             logger.error("調査フェーズ (workflow.stream) でエラー:\n%s", traceback.format_exc())
             status.update(label="⚠️ 調査中にエラーが発生しました", state="error", expanded=True)
-            status.write(str(e))
             add_display("system", "⚠️ 調査中にエラーが発生しました。もう一度お試しください。")
             _rollback_resume_banner(current_phase)
             return
@@ -1444,17 +1458,21 @@ def _build_attachment_note(files, total_cap: int = 8000) -> tuple:
     doc_note = ""
     failed = []
     if files:
-        per_cap = max(2000, total_cap // len(files))
-        for f in files:
+        # 残り予算を後続ファイル数で均等配分し、合計を必ず total_cap 以下に抑える
+        # （固定の per_cap 方式ではファイル数に比例して上限を超過していた）
+        remaining = total_cap
+        n = len(files)
+        for idx, f in enumerate(files):
             try:
                 txt = extract_text_from_file(f.name, f.getvalue())
             except Exception:
                 logger.exception("添付資料のテキスト抽出に失敗: %s", f.name)
                 txt = ""
             if txt.strip():
-                doc_note += (
-                    f"\n\n【添付資料「{f.name}」の内容抜粋】\n" + txt.strip()[:per_cap]
-                )
+                per_cap = max(1, remaining // (n - idx))
+                excerpt = txt.strip()[:per_cap]
+                remaining -= len(excerpt)
+                doc_note += f"\n\n【添付資料「{f.name}」の内容抜粋】\n" + excerpt
             else:
                 failed.append(f.name)
     return doc_note, failed
@@ -1539,9 +1557,16 @@ def render_results_detail(idata: dict):
     issues_list = idata.get("issues") or []
     uncovered = idata.get("uncovered_issues") or []
     issue_coverage = idata.get("issue_coverage") or {}
+    coverage_failed = idata.get("coverage_check_failed") or False
     covered_n = len([i for i in issues_list if i not in uncovered])
 
-    if issues_list and not uncovered:
+    if coverage_failed:
+        st.warning(
+            "🧮 網羅性チェックを実行できませんでした（AI呼び出しエラー）。"
+            "論点のカバー状況は自動確認されていないため、調査論点への対応状況を"
+            "手動でご確認ください。"
+        )
+    elif issues_list and not uncovered:
         st.success(
             f"🧮 網羅性チェック OK：調査論点 {len(issues_list)}件すべてについて、"
             f"対応する法令・情報の収集を確認しました。"
@@ -1919,7 +1944,7 @@ def render_results_detail(idata: dict):
         # Gemini API 追加利用規約により、検索候補の表示は最大5件までとする
         for s in suggestions[:5]:
             if s.get("html"):
-                components.html(_suggestion_html(s["html"]), height=72, scrolling=True)
+                st.iframe(_suggestion_html(s["html"]), height=72)
         if len(suggestions) > 5:
             st.caption(
                 f"※ 検索候補は Gemini API 利用規約に基づき最大5件まで表示しています"
@@ -2210,11 +2235,14 @@ def render_sidebar():
                 val = eq_info.get(key, "")
                 if not val:
                     continue
-                if "あり" in str(val):
+                sval = str(val)
+                # 「ありません」等の否定表現に「あり」が部分一致して⚠️に
+                # ならないよう、否定語を除外してから判定する
+                if re.search(r"あり(?!ません)", sval):
                     badge = "⚠️"
-                elif str(val) in ("なし", "なし（確認済み）"):
+                elif sval.startswith("なし") or "ありません" in sval:
                     badge = "✅"
-                elif str(val) in ("不明", "未定", "確認中"):
+                elif sval in ("不明", "未定", "確認中"):
                     badge = "❓"
                 else:
                     badge = "📌"
@@ -2241,7 +2269,7 @@ def render_sidebar():
                         + "、".join(flash["truncated"])
                     )
                 if flash.get("error"):
-                    st.error(f"登録に失敗しました: {flash['error']}")
+                    st.error("登録に失敗しました。時間をおいて再度お試しください。")
 
             registered = list_internal_docs()
             if registered:
@@ -2298,9 +2326,9 @@ def render_sidebar():
                         st.session_state.ingest_result = ingest_internal_docs(
                             [(f.name, f.getvalue()) for f in up_files]
                         )
-                    except Exception as e:
+                    except Exception:
                         logger.error("社内文書の登録でエラー:\n%s", traceback.format_exc())
-                        st.session_state.ingest_result = {"error": str(e)}
+                        st.session_state.ingest_result = {"error": True}
                 st.rerun()
 
         # ケースメモリ（承認済み過去案件・CBR）の管理
@@ -2345,9 +2373,9 @@ def render_sidebar():
 # ─────────────────────────────────────────
 def _embed_html(html_str: str, height: int = 1):
     """HTML（JavaScript含む）を iframe として埋め込む。height は 1 以上にする。
-    components.html は HTML 文字列を srcdoc 埋め込み（same-origin・scripts 許可）
+    st.iframe は HTML 文字列を srcdoc 埋め込み（same-origin・scripts 許可）
     するので、スクリプトから window.parent.document へのアクセスも従来どおり動く。"""
-    components.html(html_str, height=max(1, height))
+    st.iframe(html_str, height=max(1, height))
 
 
 def auto_scroll(duration_ms: int = 1200):

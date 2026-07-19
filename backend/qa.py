@@ -126,7 +126,7 @@ def build_context(
         blocks = [
             f"- {r.get('title', '')}\n  概要: {str(r.get('snippet', ''))[:300]}"
             for r in web_results[:8]
-            if r.get("title")
+            if r.get("title") and r.get("source") not in ("error", "unavailable")
         ]
         if blocks:
             parts.append(
