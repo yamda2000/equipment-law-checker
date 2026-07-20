@@ -17,7 +17,6 @@
 - 該当法令の法令名と優先度ラベル、非該当と判断した法令名
 """
 
-import json
 import logging
 import datetime
 import threading
@@ -68,18 +67,16 @@ def _persist_if_faiss() -> None:
         _STORE.save_local(str(_faiss_dir()))
 
 
+# ※ _load_cases / _save_cases は _LOCK 保持中から呼ばれる。
+#    threading.Lock は再入不可のため、これらの中でロックを取ってはならない
+#    （公開関数の側でロックする）。
 def _load_cases() -> list[dict]:
-    try:
-        return json.loads(_cases_path().read_text(encoding="utf-8"))
-    except Exception:
-        return []
+    return _idocs._load_json_ledger(_cases_path(), "ケースメモリ")
 
 
 def _save_cases(cases: list[dict]) -> None:
-    _idocs.INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    _cases_path().write_text(
-        json.dumps(cases, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # 一時ファイル＋os.replace で原子的に置換する（社内文書の台帳と共通）
+    _idocs._atomic_write_json(_cases_path(), cases)
 
 
 def _profile_text(equipment_info: dict) -> str:
@@ -154,7 +151,10 @@ def find_similar_cases(
     equipment_info: dict, k: int = 2, exclude_case_id: str = "",
 ) -> list[dict]:
     """新案件の設備情報に類似する過去事例を返す（類似度順・最大k件）。"""
-    cases = _load_cases()
+    # 台帳の読み込みだけロックする（保存中に読んで0件にならないため）。
+    # 埋め込み・ベクトル検索は時間がかかるためロック外で実行する
+    with _LOCK:
+        cases = _load_cases()
     if not cases:
         return []
     by_id = {c["case_id"]: c for c in cases}
@@ -215,7 +215,8 @@ def format_cases_for_prompt(cases: list[dict]) -> str:
 # ─── 管理 ─────────────────────────────────────────────────────────
 def list_cases() -> list[dict]:
     """保存済み事例の一覧（新しい順）。"""
-    cases = _load_cases()
+    with _LOCK:   # 保存・削除の書き込み中に読んで空リストにならないよう保護する
+        cases = _load_cases()
     out = []
     for c in reversed(cases):
         eq_type = ""
