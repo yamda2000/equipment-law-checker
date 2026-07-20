@@ -25,29 +25,15 @@ MAX_TEXT_CHARS = int(os.getenv("DOC_MAX_TEXT_CHARS", "160000"))
 
 # ─── ファイル種別ごとのテキスト抽出 ──────────────────────────────
 def _extract_pdf(data: bytes) -> str:
-    """PDF からテキストを抽出する。PyMuPDF を優先する（カタログ等、埋め込み
-    フォントの ToUnicode CMap が不完全な PDF でも pypdf のように文字化けしにくく
-    高速）。PyMuPDF が使えない・失敗した場合は pypdf にフォールバックする。"""
-    try:
-        import fitz  # PyMuPDF
-        parts = []
-        with fitz.open(stream=data, filetype="pdf") as doc:
-            for i, page in enumerate(doc, 1):
-                text = page.get_text().strip()
-                if text:
-                    parts.append(f"【{i}ページ】\n{text}")
-        if parts:
-            return "\n".join(parts)
-    except Exception:
-        logger.exception("PyMuPDF でのPDF抽出に失敗（pypdf にフォールバック）")
-
-    from pypdf import PdfReader
-    reader = PdfReader(io.BytesIO(data))
+    """PDF からテキストを抽出する（PyMuPDF）。カタログ等、埋め込みフォントの
+    ToUnicode CMap が不完全な PDF でも文字化けしにくく高速。"""
+    import fitz  # PyMuPDF
     parts = []
-    for i, page in enumerate(reader.pages, 1):
-        text = (page.extract_text() or "").strip()
-        if text:
-            parts.append(f"【{i}ページ】\n{text}")
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        for i, page in enumerate(doc, 1):
+            text = page.get_text().strip()
+            if text:
+                parts.append(f"【{i}ページ】\n{text}")
     return "\n".join(parts)
 
 

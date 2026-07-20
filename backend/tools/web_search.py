@@ -10,21 +10,68 @@ Gemini API 追加利用規約で禁止されているため行わない。
 
 import os
 import time
+import logging
+import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from backend.observability import observe_web_search
+
+logger = logging.getLogger(__name__)
 
 
 _MAX_RETRIES = 3
 _RETRY_BASE_WAIT = 5  # 秒（5 → 10 → 20 と増加）
+# 1リクエストのタイムアウト（ミリ秒）。Streamlit は同期実行のため、
+# 応答が返らないと調査フェーズ全体が固まる。必ず上限を設ける
+_TIMEOUT_MS = int(os.getenv("GEMINI_WEB_SEARCH_TIMEOUT_MS", "60000"))
 
-# Gemini Web検索の累積使用量（プロセス単位）。
-# アプリ側（app.py）がセッション開始時点との差分を読み取ってコスト表示に使う。
+# Gemini Web検索の累積使用量（プロセス単位・運用監視用）。
+# ※ セッション別のコスト表示には使わないこと。1プロセスが複数セッションを
+#    捌くため、この値の差分を取ると他セッションの使用分まで混ざる（誤配賦）。
+#    セッション単位の集計には collect_gemini_usage() を使う。
 _GEMINI_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+_USAGE_LOCK = threading.Lock()
+
+# 実行中のセッション（コンテキスト）ごとの集計先。
+# collect_gemini_usage() のブロック内で実行された検索だけがここに積まれる。
+_USAGE_SINK: ContextVar = ContextVar("gemini_usage_sink", default=None)
 
 
 def get_gemini_usage() -> dict:
-    """Gemini Web検索の累積使用量スナップショットを返す。"""
-    return dict(_GEMINI_USAGE)
+    """Gemini Web検索のプロセス累積使用量スナップショット（運用監視用）。"""
+    with _USAGE_LOCK:
+        return dict(_GEMINI_USAGE)
+
+
+@contextmanager
+def collect_gemini_usage():
+    """このブロック内で実行した Web 検索の使用量だけを集計する。
+
+    プロセス共有カウンタの差分方式では、複数セッションが同時に使うと
+    他セッションの検索分まで自分のコストとして計上され（かつ各セッションが
+    同じ分を計上するため二重計上になる）、正しく配賦できない。
+    呼び出し側はこのブロックの戻り値だけを自セッションの使用量として扱う。
+    """
+    sink = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+    token = _USAGE_SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _USAGE_SINK.reset(token)
+
+
+def _record_usage(prompt_tokens: int, completion_tokens: int) -> None:
+    """1回分の使用量を、プロセス累積と実行中セッションの集計先へ記録する。"""
+    with _USAGE_LOCK:
+        _GEMINI_USAGE["requests"]          += 1
+        _GEMINI_USAGE["prompt_tokens"]     += prompt_tokens
+        _GEMINI_USAGE["completion_tokens"] += completion_tokens
+    sink = _USAGE_SINK.get()
+    if sink is not None:
+        sink["requests"]          += 1
+        sink["prompt_tokens"]     += prompt_tokens
+        sink["completion_tokens"] += completion_tokens
 
 
 def search_web(query: str, context: str = "") -> list[dict]:
@@ -39,12 +86,32 @@ def search_web(query: str, context: str = "") -> list[dict]:
     return _stub_results(query)
 
 
+def _is_retryable(e: Exception) -> bool:
+    """一時的な障害（再試行する価値がある）か判定する。
+
+    レート制限に加えてタイムアウト・接続断・5xx も対象にする。
+    認証不正や不正リクエストは何度試しても同じため対象外。
+    """
+    name = type(e).__name__.lower()
+    if "timeout" in name or "connect" in name:
+        return True
+    s = str(e)
+    return any(
+        k in s for k in
+        ("429", "RESOURCE_EXHAUSTED", "500", "502", "503", "504",
+         "UNAVAILABLE", "DEADLINE_EXCEEDED", "timed out", "Timeout")
+    )
+
+
 def _search_with_gemini(query: str, api_key: str) -> list[dict]:
     """google-genai SDK v2 + Google Search Grounding で検索（429時はリトライ）"""
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=_TIMEOUT_MS),
+    )
     model_name = os.getenv("GEMINI_WEB_SEARCH_MODEL", "gemini-2.0-flash")
     safe_query = _sanitize_query(query)
 
@@ -62,15 +129,13 @@ def _search_with_gemini(query: str, api_key: str) -> list[dict]:
                     ),
                 )
 
-                # 使用量を積算（コスト表示用）
-                _GEMINI_USAGE["requests"] += 1
+                # 使用量を積算（プロセス累積＋実行中セッション分）
                 usage = getattr(response, "usage_metadata", None)
                 prompt_tokens = completion_tokens = 0
                 if usage is not None:
                     prompt_tokens     = getattr(usage, "prompt_token_count", 0) or 0
                     completion_tokens = getattr(usage, "candidates_token_count", 0) or 0
-                    _GEMINI_USAGE["prompt_tokens"]     += prompt_tokens
-                    _GEMINI_USAGE["completion_tokens"] += completion_tokens
+                _record_usage(prompt_tokens, completion_tokens)
                 obs.record(response.text or "", prompt_tokens, completion_tokens)
 
             results = []
@@ -124,14 +189,16 @@ def _search_with_gemini(query: str, api_key: str) -> list[dict]:
 
         except Exception as e:
             last_error = e
-            err_str = str(e)
-            # 429 レート制限 → 待機してリトライ
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            if attempt < _MAX_RETRIES - 1 and _is_retryable(e):
                 wait = _RETRY_BASE_WAIT * (2 ** attempt)
-                print(f"[Web検索] 429 レート制限。{wait}秒待機して再試行 ({attempt + 1}/{_MAX_RETRIES})")
+                logger.warning(
+                    "Web検索が一時エラー（%s）。%d秒待機して再試行 (%d/%d)",
+                    type(e).__name__, wait, attempt + 1, _MAX_RETRIES,
+                )
                 time.sleep(wait)
                 continue
-            # それ以外のエラーはすぐに返す
+            # 恒久的なエラー（認証不正・不正リクエスト等）は即座に返す
+            logger.warning("Web検索に失敗: %s", e)
             break
 
     return [{"source": "error", "title": str(last_error), "url": "", "snippet": "", "query": query}]

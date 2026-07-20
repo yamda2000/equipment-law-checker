@@ -44,12 +44,12 @@ from backend.doc_intake import extract_text_from_file, extract_equipment_info
 from backend.tools.internal_docs import (
     list_registered as list_internal_docs,
     ingest_files as ingest_internal_docs,
-    delete_file as delete_internal_doc,
+    delete_document as delete_internal_doc,
     delete_all as delete_all_internal_docs,
 )
 from backend.case_memory import list_cases, delete_case
 from backend.report_gen import ordinance_links_html
-from backend.tools.web_search import get_gemini_usage, search_web
+from backend.tools.web_search import collect_gemini_usage, search_web
 from backend.observability import trace_run, langfuse_enabled, get_session_cost
 from backend.qa import (
     answer_question, generate_document,
@@ -381,8 +381,6 @@ def init():
         "api_key_ok":       bool(
             os.getenv("POC_LLM_API_KEY") or os.getenv("PROD_LLM_API_KEY")
         ),
-        # Gemini Web検索コストの差分計算用（セッション開始時点の累積値）
-        "web_usage_baseline": get_gemini_usage(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -491,8 +489,11 @@ def get_llm_usage_callback():
         _llm_usage_cb_var.reset(token)
 
 
-def _record_llm_usage(cb) -> None:
+def _record_llm_usage(cb, web_cb=None) -> None:
     """get_llm_usage_callback の計測結果を案件単位で積算する。
+
+    web_cb は collect_gemini_usage() の集計結果（このセッションが実行した
+    Web検索分のみ）。渡された場合はあわせて積算する。
 
     Langfuse 設定時はコスト計測を Langfuse に一本化するため、アプリ側の
     概算積算は行わない（サイドバーのコスト表示も出ない）。
@@ -503,6 +504,7 @@ def _record_llm_usage(cb) -> None:
     含めない（誤った単価で「それらしい金額」を表示しない）。"""
     if langfuse_enabled():
         return
+    _record_web_search_usage(web_cb)
     cost = cb.total_cost
     priced = cost > 0
     if not priced and (cb.prompt_tokens or cb.completion_tokens):
@@ -527,25 +529,27 @@ def _record_llm_usage(cb) -> None:
         usage["cost"] += cost
     elif cb.prompt_tokens or cb.completion_tokens:
         usage["unpriced"] += 1
-    # Gemini Web検索の使用量も同じタイミングで同期する
-    _sync_web_search_usage()
 
 
-def _sync_web_search_usage() -> None:
-    """Gemini Web検索のプロセス累積使用量から、このセッション分の差分を積算する。
+def _record_web_search_usage(web_cb) -> None:
+    """このセッションが実行した Gemini Web検索の使用量を積算する。
+
+    web_cb は collect_gemini_usage() の集計結果。プロセス共有カウンタの
+    差分ではなく自セッション分だけを受け取るため、複数人が同時に使っても
+    他セッションの検索分が混ざらない（従来の差分方式は誤配賦・二重計上した）。
+
     単価は次の優先順で決める：
     ① 環境変数 GEMINI_COST_INPUT_PER_1M / GEMINI_COST_OUTPUT_PER_1M（明示設定）
     ② 使用モデルが既定の gemini-2.0-flash の場合のみ、内蔵の既定単価（0.10/0.40）
     どちらも該当しない（モデル変更＋単価未設定）場合は金額に計上せず
     unpriced フラグを立てる（誤った単価で計算しない）。
     検索1回あたりの課金（無料枠超過時）は GEMINI_COST_PER_SEARCH で指定する。"""
-    current = get_gemini_usage()
-    baseline = st.session_state.get("web_usage_baseline") or {
-        "prompt_tokens": 0, "completion_tokens": 0, "requests": 0
-    }
-    d_prompt   = current["prompt_tokens"]     - baseline["prompt_tokens"]
-    d_complete = current["completion_tokens"] - baseline["completion_tokens"]
-    d_requests = current["requests"]          - baseline["requests"]
+    # Langfuse 設定時はコスト計測を Langfuse に一本化する（LLM側と同じ方針）
+    if not web_cb or langfuse_enabled():
+        return
+    d_prompt   = web_cb.get("prompt_tokens", 0)
+    d_complete = web_cb.get("completion_tokens", 0)
+    d_requests = web_cb.get("requests", 0)
     if d_prompt or d_complete or d_requests:
         rates = None
         in_env  = os.getenv("GEMINI_COST_INPUT_PER_1M")
@@ -575,7 +579,6 @@ def _sync_web_search_usage() -> None:
             )
         else:
             web["unpriced"] = True
-    st.session_state.web_usage_baseline = current
 
 
 # ─────────────────────────────────────────
@@ -646,13 +649,16 @@ def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
             attached_docs.append((f.name, doc_cache[key]))
 
     # 質問パネルからの任意Web検索：質問文をそのままクエリにして参考情報を取得する
-    # （案件本体の調査とは独立。使用量は _record_llm_usage → _sync_web_search_usage で積算）
+    # （案件本体の調査とは独立。この検索は後段のLLM集計ブロックの外で実行するため、
+    #  ここで使用量を個別に集計してセッションのコストへ積算する）
     qa_web_results = []
     if use_web:
-        try:
-            qa_web_results = search_web(question)
-        except Exception:
-            logger.error("QAのWeb検索でエラー:\n%s", traceback.format_exc())
+        with collect_gemini_usage() as qa_web_cb:
+            try:
+                qa_web_results = search_web(question)
+            except Exception:
+                logger.error("QAのWeb検索でエラー:\n%s", traceback.format_exc())
+        _record_web_search_usage(qa_web_cb)
 
     context = build_qa_context(
         equipment_info,
@@ -676,7 +682,7 @@ def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
     history = build_qa_history(hist_msgs)
 
     try:
-        with get_llm_usage_callback() as cb, trace_run(
+        with get_llm_usage_callback() as cb, collect_gemini_usage() as web_cb, trace_run(
             "qa" if fmt == "answer" else "qa_doc",
             session_id=st.session_state.thread_id, input=question,
         ) as lf:
@@ -697,7 +703,7 @@ def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
                         "file": {"name": file_name, "data": data, "mime": mime},
                     }
             finally:
-                _record_llm_usage(cb)
+                _record_llm_usage(cb, web_cb)
         # 回答は質問パネル内にのみ表示する（メイン画面の会話には積まない）
         st.session_state.qa_history = qa_hist + [entry]
     except Exception:
@@ -855,7 +861,7 @@ def invoke_hearing(user_text: str):
 
     try:
         with st.spinner("情報整理・分析中..." if hearing_ending else "AIが考えています..."):
-            with get_llm_usage_callback() as cb, trace_run(
+            with get_llm_usage_callback() as cb, collect_gemini_usage() as web_cb, trace_run(
                 "hearing", session_id=st.session_state.thread_id, input=user_text,
             ) as lf:
                 try:
@@ -865,7 +871,7 @@ def invoke_hearing(user_text: str):
                     )
                 finally:
                     # エラー時も、そこまでに消費したトークンを計上する
-                    _record_llm_usage(cb)
+                    _record_llm_usage(cb, web_cb)
     except Exception:
         logger.error("invoke_hearing でエラー:\n%s", traceback.format_exc())
         add_display("system", "⚠️ AIとの通信でエラーが発生しました。お手数ですが、同じ内容をもう一度送信してください。")
@@ -916,7 +922,7 @@ def start_with_documents(files) -> bool:
                 failed.append(f.name)
         if doc_texts:
             try:
-                with get_llm_usage_callback() as cb, trace_run(
+                with get_llm_usage_callback() as cb, collect_gemini_usage() as web_cb, trace_run(
                     "doc_extraction",
                     session_id=st.session_state.thread_id,
                     input=[name for name, _t in doc_texts],
@@ -924,7 +930,7 @@ def start_with_documents(files) -> bool:
                     try:
                         extracted, truncated = extract_equipment_info(doc_texts, config=lf)
                     finally:
-                        _record_llm_usage(cb)
+                        _record_llm_usage(cb, web_cb)
             except Exception:
                 logger.error("資料からの情報抽出でエラー:\n%s", traceback.format_exc())
 
@@ -1087,7 +1093,7 @@ def resume_graph(decision):
         # 調査フェーズは各ステップの進捗をライブ表示（stream_mode="custom"）
         status = st.status("🔎 AI調査を開始しています...", expanded=True)
         try:
-            with get_llm_usage_callback() as cb, trace_run(
+            with get_llm_usage_callback() as cb, collect_gemini_usage() as web_cb, trace_run(
                 f"search:{current_phase or 'resume'}",
                 session_id=st.session_state.thread_id,
                 input=decision,
@@ -1103,7 +1109,7 @@ def resume_graph(decision):
                             status.write(entry)
                 finally:
                     # エラー時も、そこまでに消費したトークンを計上する
-                    _record_llm_usage(cb)
+                    _record_llm_usage(cb, web_cb)
         except Exception:
             logger.error("調査フェーズ (workflow.stream) でエラー:\n%s", traceback.format_exc())
             status.update(label="⚠️ 調査中にエラーが発生しました", state="error", expanded=True)
@@ -1115,7 +1121,7 @@ def resume_graph(decision):
     else:
         try:
             with st.spinner("処理中..."):
-                with get_llm_usage_callback() as cb, trace_run(
+                with get_llm_usage_callback() as cb, collect_gemini_usage() as web_cb, trace_run(
                     f"resume:{current_phase or 'resume'}",
                     session_id=st.session_state.thread_id,
                     input=decision,
@@ -1123,7 +1129,7 @@ def resume_graph(decision):
                     try:
                         workflow.invoke(Command(resume=decision), config={**config, **lf})
                     finally:
-                        _record_llm_usage(cb)
+                        _record_llm_usage(cb, web_cb)
         except Exception:
             logger.error("処理フェーズ (workflow.invoke) でエラー:\n%s", traceback.format_exc())
             add_display("system", "⚠️ 処理中にエラーが発生しました。もう一度お試しください。")
@@ -2255,6 +2261,12 @@ def render_sidebar():
 
         # 社内文書の登録・管理（Agentic RAG 検索の対象）
         with st.expander("📁 社内文書（Agentic RAG検索）"):
+            del_err = st.session_state.pop("doc_delete_error", None)
+            if del_err:
+                st.error(
+                    f"「{del_err}」の削除に失敗しました。検索インデックスから"
+                    "削除できなかったため、登録状態を維持しています。"
+                )
             flash = st.session_state.pop("ingest_result", None)
             if flash:
                 if flash.get("added"):
@@ -2277,16 +2289,21 @@ def render_sidebar():
                     f"登録済み {len(registered)} ファイル（調査時にAIが検索します）。"
                     "各ファイル右の 🗑️ で個別に削除できます。"
                 )
+                # 同名で内容の異なる資料が複数登録され得るため、doc_id を
+                # ウィジェットキー・削除キーに使う（登録日時も表示して区別する）
                 for r in registered:
                     c1, c2 = st.columns([5, 1])
                     c1.markdown(
                         f'<div style="font-size:12px;padding-top:6px;">📄 {html_lib.escape(r["name"])}'
-                        f'<span style="color:#888;">（{r["chunks"]}チャンク）</span></div>',
+                        f'<span style="color:#888;">（{r["chunks"]}チャンク'
+                        + (f'／{html_lib.escape(r["registered_at"])}' if r.get("registered_at") else "")
+                        + '）</span></div>',
                         unsafe_allow_html=True,
                     )
-                    if c2.button("🗑️", key=f"del_doc_{r['name']}", help="この文書をインデックスから削除",
+                    if c2.button("🗑️", key=f"del_doc_{r['doc_id']}", help="この文書をインデックスから削除",
                                  disabled=busy):
-                        delete_internal_doc(r["name"])
+                        if not delete_internal_doc(r["doc_id"]):
+                            st.session_state.doc_delete_error = r["name"]
                         st.rerun()
 
                 # 全削除（誤操作防止のため確認ステップを挟む）

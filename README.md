@@ -83,7 +83,8 @@
 ├── internal_docs_index/        社内文書・ケースメモリの永続化先（Git管理外）
 ├── outputs/                    生成レポート保存先（承認時に自動保存）
 ├── flow_diagram.html           処理フロー図
-├── requirements.txt
+├── requirements.txt            直接依存のバージョン範囲（更新時の指針）
+├── requirements.lock.txt       動作確認済みの全依存を固定（環境再現用）
 ├── .env.example                環境変数テンプレート
 └── README.md
 ```
@@ -114,8 +115,14 @@
 
 ```bash
 py -3.11 -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -r requirements.lock.txt
 ```
+
+`requirements.lock.txt` は動作確認済みのバージョンを全依存について固定したファイルです。
+環境を再現する場合は必ずこちらを使ってください。
+`requirements.txt` は範囲指定（人が読む用）で、依存を更新するときの指針です。
+更新した場合は動作確認のうえ、`pip freeze --exclude-editable > requirements.lock.txt`
+で lock ファイルを再生成してください。
 
 ### 2. 環境変数の設定
 
@@ -141,6 +148,7 @@ PROD_LLM_API_KEY=...
 PROD_LLM_ENDPOINT=https://<リソース名>.openai.azure.com/
 PROD_LLM_API_VERSION=2024-02-01
 PROD_LLM_DEPLOYMENT=<デプロイ名>
+PROD_LLM_MODEL=gpt-4o             # Langfuseのコスト計算に使う実モデル名（デプロイ名とは別）
 ```
 
 **Web検索を有効にする場合（任意）：**
@@ -171,6 +179,7 @@ GEMINI_WEB_SEARCH_MODEL=gemini-2.0-flash
 | `PROD_LLM_ENDPOINT` | Azure OpenAI エンドポイントURL | 本番時 |
 | `PROD_LLM_API_VERSION` | Azure OpenAI APIバージョン | 本番時 |
 | `PROD_LLM_DEPLOYMENT` | Azure OpenAI デプロイ名 | 本番時 |
+| `PROD_LLM_MODEL` | 実際のモデル名（例：`gpt-4o`）。デプロイ名は任意命名でLangfuseの単価表と一致しないため、コスト自動計算に使う | 本番時（Langfuseでコスト計測する場合） |
 | `GEMINI_API_KEY` | Gemini APIキー（Web検索用） | 任意 |
 | `GEMINI_WEB_SEARCH_MODEL` | GeminiモデルID | 任意 |
 | `POC_EMBEDDING_MODEL` | 埋め込みモデル（既定 `text-embedding-3-small`。変更時は社内文書の再登録が必要） | 任意 |

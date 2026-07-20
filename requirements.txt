@@ -1,20 +1,42 @@
+# 直接依存とそのバージョン範囲（人が読む用）。
+#
+# 実際に動作確認した環境そのものは requirements.lock.txt に固定してある。
+# 本番・CI・他の担当者の環境構築では lock ファイルを使うこと：
+#     pip install -r requirements.lock.txt
+# このファイル（範囲指定）は、依存を更新したいときの上げ幅の指針として使う。
+#
+# 上限（<N）は、次のメジャー更新が無警告で入って壊れるのを防ぐためのもの。
+# LangChain / LangGraph / OpenAI SDK は破壊的変更が多いため必ず上限を付ける。
+# 更新した場合は動作確認のうえ lock ファイルを再生成すること：
+#     pip freeze --exclude-editable > requirements.lock.txt
+
 streamlit==1.58.0
-langgraph>=0.2.0
-langchain>=0.3.0
-langchain-openai>=0.2.0
-langchain-community>=0.3.0
-chromadb>=0.5.0
-langchain-chroma>=1.0.0
-faiss-cpu>=1.8.0
-python-dotenv>=1.0.0
-requests>=2.31.0
-python-pptx>=1.0.0
-pypdf>=6.0.0
-pymupdf>=1.24.0
-python-docx>=1.1.0
-openpyxl>=3.1.0
-jinja2>=3.1.0
-google-genai>=2.0.0
-openai>=1.50.0
-langfuse>=4.0.0
-fonttools>=4.60.0
+
+langgraph>=1.2,<2
+langchain>=1.3,<2
+langchain-openai>=1.3,<2
+langchain-community>=0.4,<0.5
+openai>=2.44,<3
+
+chromadb>=1.5,<2
+langchain-chroma>=1.1,<2
+faiss-cpu>=1.14,<2
+
+# 社内文書のハイブリッド検索（ベクトル＋BM25）用
+# langchain-classic は langchain-community の依存で間接的に入るが、
+# EnsembleRetriever を直接importするため明示しておく
+langchain-classic>=1.0,<2
+rank-bm25>=0.2,<1
+
+google-genai>=2.10,<3
+langfuse>=4.14,<5
+
+python-dotenv>=1.2,<2
+requests>=2.34,<3
+jinja2>=3.1,<4
+
+pymupdf>=1.28,<2
+python-docx>=1.2,<2
+python-pptx>=1.0,<2
+openpyxl>=3.1,<4
+fonttools>=4.63,<5

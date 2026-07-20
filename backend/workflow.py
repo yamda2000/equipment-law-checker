@@ -57,6 +57,10 @@ def _llm(temperature: float = 1.0, max_tokens: int | None = None):
             azure_endpoint=os.getenv("PROD_LLM_ENDPOINT", ""),
             api_key=os.getenv("PROD_LLM_API_KEY", ""),
             openai_api_version=os.getenv("PROD_LLM_API_VERSION", "2024-02-01"),
+            # Azure のデプロイ名（azure_deployment）は任意の管理者命名で
+            # Langfuse の単価表と一致しないため、実モデル名を model で別途渡す
+            # （Langfuse はこちらをコスト計算に使う。デプロイ名とは独立）
+            model=os.getenv("PROD_LLM_MODEL", "gpt-4o"),
             temperature=temperature,
             max_tokens=max_tokens,
         )
@@ -978,13 +982,15 @@ def search_node(state: AppState) -> dict:
         egov_res     = [r for r in rest if _src(r) == "egov"]
         web_res      = [r for r in rest if _src(r) == "web"]
 
-        # クォータの合計が budget を超えないよう先に確定させる
-        # （従来は internal を無制限に連結してから全体をスライスしていたため、
-        # 社内文書が多いと「Web最低15件」の保証が最終スライスで破られていた）
-        internal_quota = min(len(internal_res), budget)
-        rem = budget - internal_quota
-        web_quota  = min(len(web_res), max(min(WEB_MIN_KEEP, rem), rem - len(egov_res)))
-        egov_quota = min(len(egov_res), rem - web_quota)
+        # クォータは「Web最低枠 → 社内文書 → 残りをWeb上積み → e-Gov」の順に確定する。
+        # Web枠を最初に確保しないと、社内文書が予算を占有したときに条例・届出先の
+        # 主要ソースであるWebが0件になる（合計を後から切り詰める方式でも同じ）。
+        web_floor      = min(len(web_res), WEB_MIN_KEEP, budget)
+        internal_quota = min(len(internal_res), budget - web_floor)
+        rem            = budget - web_floor - internal_quota
+        # 余剰枠はWebを上積みしてからe-Govに回す（e-Govは必須法令を優先保持）
+        web_quota  = web_floor + min(len(web_res) - web_floor, max(0, rem - len(egov_res)))
+        egov_quota = min(len(egov_res), budget - web_quota - internal_quota)
 
         dropped_internal = len(internal_res) - internal_quota
         dropped_egov     = len(egov_res) - egov_quota
@@ -1005,14 +1011,28 @@ def search_node(state: AppState) -> dict:
                 f"Web {dropped_web}件" if dropped_web else "",
                 f"社内文書 {dropped_internal}件" if dropped_internal else "",
             ) if s
+        ) or "なし"
+        # 実際に保持した件数を明示する（「Web最低枠を確保」と書きながら
+        # 0件になっている、といった事実と異なる説明を避ける）
+        kept_str = (
+            f"網羅性補完 {len(protected_res)}件・社内文書 {internal_quota}件・"
+            f"e-Gov {egov_quota}件・Web {web_quota}件"
         )
         warn = (
             f"⚠️ 収集件数が上限{MAX_SEARCH_RESULTS}件を超えたため、"
-            f"{dropped_str}を割愛しました"
-            f"（必須法令・網羅性補完の取得分・Web最低{WEB_MIN_KEEP}件枠を優先保持）"
+            f"{dropped_str}を割愛しました（保持: {kept_str}）"
         )
         progress_messages.append(AIMessage(content=warn, name="search_progress"))
         emit(warn)
+        # Web枠すら確保できないほど網羅性補完分が多い場合は、条例・届出先の
+        # 情報が不足している可能性を別途警告する
+        if web_res and web_quota < min(len(web_res), WEB_MIN_KEEP):
+            short = (
+                f"⚠️ 収集件数の上限により、Web情報を{web_quota}件しか保持できませんでした"
+                f"（推奨 {WEB_MIN_KEEP}件）。条例・届出先の情報が不足している可能性があります。"
+            )
+            progress_messages.append(AIMessage(content=short, name="search_progress"))
+            emit(short)
 
     if egov_api_errors:
         warn = (
