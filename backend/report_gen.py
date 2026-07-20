@@ -94,6 +94,7 @@ def generate_html_report(
     issues: list = None,
     issue_coverage: dict = None,
     coverage_check_failed: bool = False,
+    web_search_unconfirmed: bool = False,
 ) -> str:
     """法令別アクションアイテムから HTML レポートを生成する"""
     now = datetime.now()
@@ -118,6 +119,7 @@ def generate_html_report(
         issues or [], uncovered_issues or [], issue_coverage or {},
         check_failed=coverage_check_failed,
     )
+    web_unconfirmed_html = _build_web_unconfirmed_notice(web_search_unconfirmed)
     matrix_html    = _build_law_matrix(law_items, excluded_laws or [], equipment_info)
 
     return f"""<!DOCTYPE html>
@@ -210,6 +212,8 @@ def generate_html_report(
 {checklist_html}
 
 {uncovered_html}
+
+{web_unconfirmed_html}
 
 {matrix_html}
 
@@ -744,6 +748,22 @@ def _build_law_items(law_items: list) -> str:
   {'<div class="section-label">🏢 社内対応事項</div>' + internal_html if internal_html else ''}
 </div>"""
     return html
+
+
+def _build_web_unconfirmed_notice(unconfirmed: bool) -> str:
+    """Web検索が1件も実行・成功できなかった場合の明示。
+    「Web 0件」を条例・届出先の情報が実際に無かった結果と混同させないための警告。"""
+    if not unconfirmed:
+        return ""
+    return (
+        '<div style="background:#FFEBEE;border:1px solid #EF9A9A;border-left:5px solid #C62828;'
+        'border-radius:6px;padding:14px 18px;font-size:13px;color:#B71C1C;margin:12px 0;">'
+        '<strong>⚠️ Web情報（条例・届出先など）は未確認です：</strong>'
+        'この調査ではWeb検索が1件も実行・成功できませんでした（GEMINI_API_KEY未設定、'
+        'または継続的なエラー）。e-Gov法令API・社内文書に収載のない条例・届出先の情報は'
+        '本レポートに反映されていない可能性があります。担当部署・所轄機関への直接確認を推奨します。'
+        '</div>'
+    )
 
 
 def _build_coverage_check(

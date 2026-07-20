@@ -1564,7 +1564,16 @@ def render_results_detail(idata: dict):
     uncovered = idata.get("uncovered_issues") or []
     issue_coverage = idata.get("issue_coverage") or {}
     coverage_failed = idata.get("coverage_check_failed") or False
+    web_unconfirmed = idata.get("web_search_unconfirmed") or False
     covered_n = len([i for i in issues_list if i not in uncovered])
+
+    if web_unconfirmed:
+        st.warning(
+            "🌐 Web情報（条例・届出先など）は未確認です。この調査ではWeb検索が"
+            "1件も実行・成功できませんでした（GEMINI_API_KEY未設定、または継続的な"
+            "エラー）。e-Gov法令API・社内文書に収載のない条例・届出先の情報は"
+            "反映されていない可能性があります。"
+        )
 
     if coverage_failed:
         st.warning(

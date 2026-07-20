@@ -483,20 +483,22 @@ def _process_web_results(
     label: str,
     icon: str = "🌐",
     suggestions_out: list | None = None,
-) -> tuple[str, int]:
-    """Web・社内文書の検索結果を処理し、エラーと正常結果を判別してログエントリを返す。"""
+) -> tuple[str, int, str]:
+    """Web・社内文書の検索結果を処理し、エラーと正常結果を判別してログエントリを返す。
+    戻り値3番目の status は "ok" / "error" / "unavailable"（呼び出し側で
+    Web検索の未確認件数を集計するために使う）。"""
     # エラー結果の検出
     errors = [r for r in web_results if r.get("source") == "error"]
     if errors:
         err_msg = errors[0].get("title", "不明なエラー")
         entry = f"⚠️ [{label}] 「{query}」→ エラー: {err_msg}"
-        return entry, 0
+        return entry, 0, "error"
 
     # Web検索未設定（GEMINI_API_KEY なし）のプレースホルダーは実結果として
     # 扱わない（網羅性チェック・統合LLMの根拠に混入させない）
     if any(r.get("source") == "unavailable" for r in web_results):
         entry = f"⚠️ [{label}] 「{query}」→ Web検索は未実行（GEMINI_API_KEY未設定・未確認）"
-        return entry, 0
+        return entry, 0, "unavailable"
 
     added = 0
     for r in web_results:
@@ -515,7 +517,7 @@ def _process_web_results(
             results.append(r)
             added += 1
     entry = f"{icon} [{label}] 「{query}」→ {added}件取得"
-    return entry, added
+    return entry, added, "ok"
 
 
 # ─── ノード: 検索（Agentic Search） ──────────────────────────────
@@ -555,7 +557,20 @@ def search_node(state: AppState) -> dict:
     # e-Gov APIエラーで結果を取得できなかった検索の件数。
     # 「0件ヒット」と「未確認」を混同すると確認漏れになるため、担当者に明示する
     egov_api_errors = 0
+    # Web検索の試行回数と、そのうち未確認（未実行・エラー）だった件数。
+    # e-Govと同様「0件ヒット」と「未確認」を混同しないよう、Web版も集約警告を出す
+    web_attempts = 0
+    web_unconfirmed_count = 0
     is_reinvestigation = bool(prev_results)
+
+    if not os.getenv("GEMINI_API_KEY", ""):
+        warn = (
+            "⚠️ GEMINI_API_KEY が未設定のため、この調査ではWeb検索が実行されません。"
+            "条例・届出先などWeb由来の情報は e-Gov法令API・社内文書のみでの確認となり、未確認のまま進みます。"
+        )
+        search_log.append(warn)
+        progress_messages.append(AIMessage(content=warn, name="search_progress"))
+        emit(warn)
 
     if is_reinvestigation:
         # 再調査時は前回のシード検索結果を引き継いでいるため、
@@ -623,7 +638,10 @@ def search_node(state: AppState) -> dict:
             web_results = search_web(local_query)
             executed_queries.add(local_query)
             search_count += 1
-            entry, added = _process_web_results(web_results, local_query, seen_titles, results, "条例Web", suggestions_out=search_suggestions)
+            entry, added, status = _process_web_results(web_results, local_query, seen_titles, results, "条例Web", suggestions_out=search_suggestions)
+            web_attempts += 1
+            if status != "ok":
+                web_unconfirmed_count += 1
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
             emit(entry)
@@ -634,7 +652,10 @@ def search_node(state: AppState) -> dict:
         web_results = search_web(guideline_query)
         executed_queries.add(guideline_query)
         search_count += 1
-        entry, added = _process_web_results(web_results, guideline_query, seen_titles, results, "ガイドラインWeb", suggestions_out=search_suggestions)
+        entry, added, status = _process_web_results(web_results, guideline_query, seen_titles, results, "ガイドラインWeb", suggestions_out=search_suggestions)
+        web_attempts += 1
+        if status != "ok":
+            web_unconfirmed_count += 1
         search_log.append(entry)
         progress_messages.append(AIMessage(content=entry, name="search_progress"))
         emit(entry)
@@ -649,7 +670,7 @@ def search_node(state: AppState) -> dict:
                 internal_hits = search_internal_docs(internal_query)
                 executed_queries.add(internal_query)
                 search_count += 1
-                entry, added = _process_web_results(internal_hits, internal_query, seen_titles, results, "社内文書", icon="📁")
+                entry, added, _ = _process_web_results(internal_hits, internal_query, seen_titles, results, "社内文書", icon="📁")
                 search_log.append(entry)
                 progress_messages.append(AIMessage(content=entry, name="search_progress"))
                 emit(entry)
@@ -813,7 +834,7 @@ def search_node(state: AppState) -> dict:
                 on_progress=_rag_progress,
             )
             search_count += 1
-            entry, added = _process_web_results(internal_hits, action.query, seen_titles, results, "社内文書", icon="📁")
+            entry, added, _ = _process_web_results(internal_hits, action.query, seen_titles, results, "社内文書", icon="📁")
             entry = entry.replace("取得", "新規取得")
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
@@ -822,7 +843,10 @@ def search_node(state: AppState) -> dict:
             emit(f"🌐 Web検索中:「{action.query}」")
             web_results = search_web(action.query)
             search_count += 1
-            entry, added = _process_web_results(web_results, action.query, seen_titles, results, "AIWeb検索", suggestions_out=search_suggestions)
+            entry, added, status = _process_web_results(web_results, action.query, seen_titles, results, "AIWeb検索", suggestions_out=search_suggestions)
+            web_attempts += 1
+            if status != "ok":
+                web_unconfirmed_count += 1
             entry = entry.replace("取得", "新規取得")
             search_log.append(entry)
             progress_messages.append(AIMessage(content=entry, name="search_progress"))
@@ -908,11 +932,14 @@ def search_node(state: AppState) -> dict:
                         context_hint=json.dumps(equipment_info, ensure_ascii=False),
                         on_progress=emit,
                     )
-                    entry, added = _process_web_results(internal_hits, q, seen_titles, results, "網羅性補完(社内)", icon="📁")
+                    entry, added, _ = _process_web_results(internal_hits, q, seen_titles, results, "網羅性補完(社内)", icon="📁")
                 else:
                     emit(f"🌐 [網羅性補完] Web検索:「{q}」")
                     web_results = search_web(q)
-                    entry, added = _process_web_results(web_results, q, seen_titles, results, "網羅性補完", suggestions_out=search_suggestions)
+                    entry, added, status = _process_web_results(web_results, q, seen_titles, results, "網羅性補完", suggestions_out=search_suggestions)
+                    web_attempts += 1
+                    if status != "ok":
+                        web_unconfirmed_count += 1
                 search_log.append(entry)
                 progress_messages.append(AIMessage(content=entry, name="search_progress"))
                 emit(entry)
@@ -1044,6 +1071,27 @@ def search_node(state: AppState) -> dict:
         progress_messages.append(AIMessage(content=warn, name="search_progress"))
         emit(warn)
 
+    # Web検索が1件も実行できなかった場合は、e-Govと同様に集約警告を出す。
+    # 「Web 0件」表示だけでは「該当情報なし」なのか「検索自体が動いていない」のか
+    # 区別できないため、結果確認画面・レポートにも state で明示する
+    web_search_unconfirmed = bool(web_attempts) and web_unconfirmed_count == web_attempts
+    if web_search_unconfirmed:
+        warn = (
+            f"⚠️ Web検索が{web_attempts}回とも未実行・失敗でした（GEMINI_API_KEY未設定、"
+            f"または一時的なエラー）。条例・届出先などWeb由来の情報は未確認です。"
+        )
+        search_log.append(warn)
+        progress_messages.append(AIMessage(content=warn, name="search_progress"))
+        emit(warn)
+    elif web_unconfirmed_count:
+        warn = (
+            f"⚠️ Web検索{web_attempts}回中{web_unconfirmed_count}回が未実行・失敗でした。"
+            f"該当分は「該当なし」ではなく未確認のため、確認漏れの可能性があります。"
+        )
+        search_log.append(warn)
+        progress_messages.append(AIMessage(content=warn, name="search_progress"))
+        emit(warn)
+
     egov_count     = len([r for r in results if "e-Gov" in r.get("source", "")])
     internal_count = len([r for r in results if r.get("source", "") == "社内文書"])
     web_count      = len(results) - egov_count - internal_count
@@ -1063,6 +1111,7 @@ def search_node(state: AppState) -> dict:
         "uncovered_issues": uncovered_issues,
         "issue_coverage":   issue_coverage,
         "coverage_check_failed": coverage_check_failed,
+        "web_search_unconfirmed": web_search_unconfirmed,
         "search_suggestions": search_suggestions,
         "phase":            "synthesizing",
         "messages":         progress_messages,
@@ -1560,6 +1609,7 @@ def results_review_node(state: AppState) -> dict:
         "issues":           state.get("issues", []),   # 網羅性チェック表示用
         "issue_coverage":   state.get("issue_coverage", {}),  # カバー元の法令表示用
         "coverage_check_failed": state.get("coverage_check_failed", False),
+        "web_search_unconfirmed": state.get("web_search_unconfirmed", False),
     })
 
     # 「足りない・再調査して」依頼なら検索フェーズに戻す
@@ -1639,6 +1689,7 @@ def report_node(state: AppState) -> dict:
         issues=state.get("issues", []),
         issue_coverage=state.get("issue_coverage", {}),
         coverage_check_failed=state.get("coverage_check_failed", False),
+        web_search_unconfirmed=state.get("web_search_unconfirmed", False),
     )
 
     # Human in the loop: レポートレビュー

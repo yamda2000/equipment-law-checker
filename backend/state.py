@@ -42,6 +42,9 @@ class AppState(TypedDict):
     # 網羅性検証のカバー元マップ {論点: [カバーする法令・情報タイトル, ...]}
     # （カバー判定の妥当性を人が検証できるようレポート・結果確認に表示する）
     issue_coverage: dict
+    # Web検索が1件も実行・成功できなかった場合の明示フラグ
+    # （GEMINI_API_KEY未設定・継続的なエラー時。「Web 0件」と「未確認」を混同しないため）
+    web_search_unconfirmed: bool
 
     # 統合前にe-Govから取得した条文抜粋のキャッシュ
     # {"law_ids": [...], "excerpts": str}。再調査後の再統合で法令候補が
