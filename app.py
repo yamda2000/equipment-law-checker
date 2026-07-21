@@ -7,6 +7,7 @@ import os
 import re
 import html as html_lib
 import hashlib
+import json
 import time
 import uuid
 import sys
@@ -38,7 +39,7 @@ from backend.workflow import (
 )
 from backend.tools.egov import (
     fetch_article_text, fetch_article_captions, fetch_article_chapters,
-    article_sort_key,
+    article_sort_key, search_laws_by_keyword, EgovAPIError,
 )
 from backend.doc_intake import extract_text_from_file, extract_equipment_info
 from backend.tools.internal_docs import (
@@ -46,15 +47,17 @@ from backend.tools.internal_docs import (
     ingest_files as ingest_internal_docs,
     delete_document as delete_internal_doc,
     delete_all as delete_all_internal_docs,
+    search_internal_docs, internal_docs_available,
 )
 from backend.case_memory import list_cases, delete_case
 from backend.report_gen import ordinance_links_html
 from backend.tools.web_search import collect_gemini_usage, search_web
 from backend.observability import trace_run, langfuse_enabled, get_session_cost
 from backend.qa import (
-    answer_question, generate_document,
+    answer_question, generate_document, extract_law_names,
     build_context as build_qa_context, build_history as build_qa_history,
 )
+from backend.verify import verify_law_deliveries
 from backend.doc_export import build_file as build_doc_file
 
 # ─────────────────────────────────────────
@@ -489,6 +492,33 @@ def get_llm_usage_callback():
         _llm_usage_cb_var.reset(token)
 
 
+def format_live_usage(cb) -> str:
+    """調査など重い処理の実行中に、これまでのAI利用状況をライブ表示する文字列。
+    サイドバーのコスト（Langfuse実測値・反映が遅れる）とは別に、処理中も進捗が
+    見えるよう、コールバックが積算した呼び出し回数・トークンをその場で表示する。
+    単価（LLM_COST_*_PER_1M）が設定されていれば概算額も添える。"""
+    calls      = cb.successful_requests
+    prompt     = cb.prompt_tokens
+    completion = cb.completion_tokens
+    in_rate  = os.getenv("LLM_COST_INPUT_PER_1M")
+    out_rate = os.getenv("LLM_COST_OUTPUT_PER_1M")
+    if in_rate and out_rate:
+        try:
+            jpy_rate = float(os.getenv("LLM_COST_JPY_RATE", "150"))
+            cost = prompt / 1e6 * float(in_rate) + completion / 1e6 * float(out_rate)
+            return (
+                f"💰 AI利用（実行中の概算）：生成AI {calls}回 / "
+                f"${cost:.3f}（約 {cost * jpy_rate:,.0f}円）"
+            )
+        except ValueError:
+            pass
+    return (
+        f"💰 AI利用（実行中）：生成AI {calls}回・"
+        f"入力 {prompt:,} / 出力 {completion:,} トークン"
+        f"（確定額は完了後にサイドバーへ反映）"
+    )
+
+
 def _record_llm_usage(cb, web_cb=None) -> None:
     """get_llm_usage_callback の計測結果を案件単位で積算する。
 
@@ -584,11 +614,19 @@ def _record_web_search_usage(web_cb) -> None:
 # ─────────────────────────────────────────
 # 確認フェーズの QA（質問対応）
 # ─────────────────────────────────────────
-def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
+def run_qa(
+    question: str,
+    fmt: str = "answer",
+    use_web: bool = False,
+    use_internal: bool = False,
+    use_egov: bool = False,
+) -> None:
     """確認フェーズの質問に回答する。ワークフローの状態（interrupt/checkpointer）は
     一切変更しない。回答は display_messages にのみ積む。
     fmt: "answer"（回答のみ）／ "html"・"docx"・"pdf"・"pptx"（依頼内容から資料ファイルを作成）
-    use_web: True の場合、質問文でWeb検索を実行し、結果を回答・資料の根拠に加える"""
+    use_web: True の場合、質問文でWeb検索を実行し、結果を回答・資料の根拠に加える
+    use_internal: True の場合、質問文で社内文書を検索し、結果を根拠に加える
+    use_egov: True の場合、質問文からAIが法令名を抽出して e-Gov 法令検索を実行する"""
     phase = (st.session_state.interrupt_data or {}).get("phase", "")
     label = {
         "policy_review":  "3. 調査方針確認（調査はまだ実施していない）",
@@ -660,6 +698,33 @@ def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
                 logger.error("QAのWeb検索でエラー:\n%s", traceback.format_exc())
         _record_web_search_usage(qa_web_cb)
 
+    # 任意の社内文書検索：登録済み社内文書を質問文でハイブリッド検索する
+    # （埋め込みの費用は既存方針どおりコスト表示に含めない）
+    qa_internal_results = []
+    if use_internal:
+        try:
+            qa_internal_results = search_internal_docs(question)
+        except Exception:
+            logger.error("QAの社内文書検索でエラー:\n%s", traceback.format_exc())
+
+    # 任意の法令検索(e-Gov)：質問文からAIが法令名を抽出 → e-Gov で該当法令を引く。
+    # 抽出は1回のLLM呼び出しなので、コスト積算・トレースの対象にする。
+    qa_law_results = []
+    if use_egov:
+        try:
+            with get_llm_usage_callback() as law_cb, trace_run(
+                "qa_law_extract", session_id=st.session_state.thread_id, input=question,
+            ) as lf_law:
+                law_names = extract_law_names(question, equipment_info, config=lf_law)
+            _record_llm_usage(law_cb)
+            for name in law_names:
+                try:
+                    qa_law_results.extend(search_laws_by_keyword(name, max_results=3))
+                except EgovAPIError as e:
+                    logger.warning("QAのe-Gov検索でAPIエラー '%s': %s", name, e)
+        except Exception:
+            logger.error("QAの法令検索でエラー:\n%s", traceback.format_exc())
+
     context = build_qa_context(
         equipment_info,
         st.session_state.get("policy_idata"),
@@ -668,6 +733,8 @@ def run_qa(question: str, fmt: str = "answer", use_web: bool = False) -> None:
         search_sources=search_sources,
         attached_docs=attached_docs,
         web_results=qa_web_results,
+        internal_results=qa_internal_results,
+        law_results=qa_law_results,
     )
     # 直近の文脈：メイン画面の会話＋パネル内のQAやり取り
     # （QAは display_messages に積まないため、qa_history から補う。
@@ -769,9 +836,11 @@ def render_qa_input():
             # 最新の位置に表示。メイン画面には何も出さない）
             pending = st.session_state.pop("pending_qa_question", None)
             if pending:
-                p_q   = pending["q"]
-                p_fmt = pending.get("fmt", "answer")
-                p_web = bool(pending.get("web"))
+                p_q        = pending["q"]
+                p_fmt      = pending.get("fmt", "answer")
+                p_web      = bool(pending.get("web"))
+                p_internal = bool(pending.get("internal"))
+                p_egov     = bool(pending.get("egov"))
                 q_html = html_lib.escape(p_q).replace("\n", "<br>")
                 st.markdown(
                     f'<div class="qa-panel-answer">'
@@ -783,10 +852,21 @@ def render_qa_input():
                     "💬 質問に回答しています..." if p_fmt == "answer"
                     else "📄 資料を作成しています...（1分ほどかかる場合があります）"
                 )
+                # 実行する検索を先頭に付けて、処理中に何をしているか見せる
+                prefixes = []
+                if p_egov:
+                    prefixes.append("⚖️ 法令検索中...")
+                if p_internal:
+                    prefixes.append("🏢 社内文書検索中...")
                 if p_web:
-                    spinner_msg = "🌐 Web検索中... → " + spinner_msg
+                    prefixes.append("🌐 Web検索中...")
+                if prefixes:
+                    spinner_msg = " → ".join(prefixes) + " → " + spinner_msg
                 with st.spinner(spinner_msg):
-                    run_qa(p_q, p_fmt, use_web=p_web)
+                    run_qa(
+                        p_q, p_fmt,
+                        use_web=p_web, use_internal=p_internal, use_egov=p_egov,
+                    )
                 st.rerun()   # 処理中表示を消し、上の履歴表示に切り替える
             # 添付はフォームの外に置く（clear_on_submit で消えず、連続質問で使い回せる）
             st.file_uploader(
@@ -795,13 +875,20 @@ def render_qa_input():
                 accept_multiple_files=True,
                 key="qa_files",
             )
-            with st.form("qa_form", clear_on_submit=True):
+            # 送信後は質問文だけ空にし、出力形式・検索チェックは前回の選択を維持する。
+            # clear_on_submit=True だと全ウィジェットが初期値に戻ってしまうため、
+            # 各ウィジェットにキーを付けて状態を保持し、質問文だけフラグで消す。
+            # キー付きウィジェットの値はウィジェット生成前にしか変更できない。
+            if st.session_state.pop("_qa_clear_text", False):
+                st.session_state.qa_q_text = ""
+            with st.form("qa_form", clear_on_submit=False):
                 q = st.text_area(
                     "質問内容",
                     placeholder="例：「特定施設」とはなんですか？　添付資料のこの装置に届出は必要ですか？\n"
                                 "（資料作成の例：この案件の対応事項を上長向けの説明資料にまとめて）",
                     height=80,
                     label_visibility="collapsed",
+                    key="qa_q_text",
                 )
                 fmt_labels = {
                     "💬 回答のみ":   "answer",
@@ -814,12 +901,36 @@ def render_qa_input():
                     "出力形式",
                     list(fmt_labels.keys()),
                     horizontal=True,
+                    key="qa_fmt",
                     help="「HTML・Word・PDF・PowerPoint」を選ぶと、入力内容を依頼として"
                          "資料ファイルを作成し、ダウンロードできます（案件・調査には反映されません）。",
+                )
+                st.caption("🔎 回答の根拠に追加で検索する（任意・複数選択可）：")
+                use_egov = st.checkbox(
+                    "⚖️ 法令検索（e-Gov）を使う（関連する法令をAIが探して提示）",
+                    value=False,
+                    key="qa_use_egov",
+                    help="質問文からAIが法令名を推定し、e-Gov 法令データベースで該当法令"
+                         "（名称・法令番号・原文リンク）を検索します。条文本文までは取得しません。"
+                         "案件本体の調査には反映されません。法令名抽出のためLLMを1回使います。",
+                )
+                internal_ready = internal_docs_available()
+                use_internal = st.checkbox(
+                    "🏢 社内文書検索を使う（登録済みの社内規定・過去事例から探す）",
+                    value=False,
+                    key="qa_use_internal",
+                    disabled=not internal_ready,
+                    help=(
+                        "質問文で登録済みの社内文書を検索し、関連する抜粋を回答・資料の根拠に"
+                        "加えます。案件本体の調査には反映されません。"
+                        if internal_ready else
+                        "社内文書が未登録です。サイドバーの「📁 社内文書」から登録すると使えます。"
+                    ),
                 )
                 use_web = st.checkbox(
                     "🌐 Web検索を使う（最新の公開情報を検索して回答・資料の根拠に加える）",
                     value=False,
+                    key="qa_use_web",
                     help="質問文でWeb検索（Google検索）を実行し、その結果も参考にします。"
                          "案件本体の調査には反映されません。少し時間と費用がかかります。",
                 )
@@ -827,7 +938,10 @@ def render_qa_input():
                     if q.strip():
                         st.session_state.pending_qa_question = {
                             "q": q.strip(), "fmt": fmt_labels[fmt_choice], "web": use_web,
+                            "internal": use_internal and internal_ready, "egov": use_egov,
                         }
+                        # 次の描画で質問文だけ空にする（形式・チェックは維持）
+                        st.session_state._qa_clear_text = True
                         st.rerun()
 
 
@@ -913,7 +1027,7 @@ def start_with_documents(files) -> bool:
     （呼び出し側で通常ヒアリングにフォールバックする）。"""
     doc_texts, failed, truncated = [], [], []
     extracted = None
-    with st.spinner("📄 資料から設備情報を抽出中...（資料が多いと1分程度かかります）"):
+    with st.spinner("📄 資料から設備情報を抽出中...（資料が多い・長いと数分かかることがあります）"):
         for f in files:
             text = extract_text_from_file(f.name, f.getvalue())
             if text.strip():
@@ -1092,6 +1206,9 @@ def resume_graph(decision):
     if will_search:
         # 調査フェーズは各ステップの進捗をライブ表示（stream_mode="custom"）
         status = st.status("🔎 AI調査を開始しています...", expanded=True)
+        # 生成AIを何度も呼ぶ調査中も利用状況が見えるよう、進捗ごとに更新する
+        # ライブ表示（サイドバーのLangfuse実測値は完了後に反映される）
+        cost_ph = st.empty()
         try:
             with get_llm_usage_callback() as cb, collect_gemini_usage() as web_cb, trace_run(
                 f"search:{current_phase or 'resume'}",
@@ -1107,9 +1224,12 @@ def resume_graph(decision):
                         if entry:
                             status.update(label=f"AI調査中... {entry}")
                             status.write(entry)
+                            # 進捗ステップごとに、これまでのAI利用状況を更新表示
+                            cost_ph.markdown(format_live_usage(cb))
                 finally:
                     # エラー時も、そこまでに消費したトークンを計上する
                     _record_llm_usage(cb, web_cb)
+                    cost_ph.markdown(format_live_usage(cb))
         except Exception:
             logger.error("調査フェーズ (workflow.stream) でエラー:\n%s", traceback.format_exc())
             status.update(label="⚠️ 調査中にエラーが発生しました", state="error", expanded=True)
@@ -1137,6 +1257,9 @@ def resume_graph(decision):
             return
 
     _process_new_msgs(old_count, skip_human=False)
+    # 重い処理の直後は、サイドバーが最新のLangfuse実測コストを取り直すよう促す
+    # （通常の15/60秒間隔を待たず、次の描画で即取得させる）
+    st.session_state.pop("lf_cost_ts", None)
 
     idata = get_interrupt_data(st.session_state.thread_id)
     if idata:
@@ -1544,6 +1667,55 @@ def render_policy_review(idata: dict):
 # ─────────────────────────────────────────
 # 結果レビュー UI
 # ─────────────────────────────────────────
+# ─── 対応事項のAI再チェック（読み取り専用） ─────────────────────
+# 判定バッジの表示スタイル
+_VERDICT_STYLE = {
+    "ok":       ("✅", "根拠あり",   "#2E7D32", "#E8F5E9"),
+    "check":    ("⚠️", "要確認",     "#F57F17", "#FFF8E1"),
+    "conflict": ("❗", "矛盾の疑い", "#C62828", "#FFEBEE"),
+}
+
+
+def _delivery_check_sig(law_items: list) -> str:
+    """対応事項チェック結果の有効性判定用シグネチャ。law_items の届出内容が
+    変われば（再調査など）前回のチェック結果を無効にするために使う。"""
+    basis = [
+        (l.get("law_name", ""),
+         [(d.get("item", ""), d.get("authority", ""), d.get("deadline", ""),
+           d.get("law_article", "")) for d in l.get("deliveries", []) or []])
+        for l in law_items
+    ]
+    return hashlib.sha256(
+        json.dumps(basis, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _equip_summary_for_check(equip: dict) -> str:
+    """設備情報（{field:{value,evidence}}）を検証用の短い要約テキストにする。"""
+    lines = []
+    for k, v in (equip or {}).items():
+        val = (v or {}).get("value", "").strip() if isinstance(v, dict) else str(v).strip()
+        if val:
+            lines.append(f"・{to_ja_field_names(k)}: {val}")
+    return "\n".join(lines)
+
+
+def _web_context_for_law(law: dict, src_by_url: dict) -> str:
+    """この法令の届出に紐づくWeb出典・届出先の根拠を検証用テキストにまとめる。"""
+    parts = []
+    for d in law.get("deliveries", []) or []:
+        basis = (d.get("authority_basis") or "").strip()
+        url = (d.get("authority_source_url") or "").strip()
+        if basis:
+            parts.append(f"- 届出先の根拠: {basis}")
+        if url:
+            r = src_by_url.get(url) or {}
+            title = (d.get("authority_source_title") or r.get("title") or "出典").strip()
+            snippet = (r.get("snippet") or "").strip()
+            parts.append(f"  出典: {title}（{url}）" + (f"\n  概要: {snippet[:300]}" if snippet else ""))
+    return "\n".join(parts)
+
+
 def render_results_detail(idata: dict):
     """調査結果の詳細（サマリー・件数・法令カード）を描画する。
     ステップ5（結果確認）とステップ6（レポート作成）の両方で再利用する。"""
@@ -1685,6 +1857,67 @@ def render_results_detail(idata: dict):
                 merged_caps.update(caps)
                 st.session_state[f"article_caption_{_lid}"] = merged_caps
 
+    # ── 対応事項のAI再チェック（届出のある法令が対象） ──
+    _deliv_law_idxs = [i for i, l in enumerate(law_items) if l.get("deliveries")]
+    _check_sig = _delivery_check_sig(law_items)
+    _dchecks = st.session_state.get("delivery_checks") or {}
+    _dchecks_valid = bool(_dchecks) and st.session_state.get("delivery_checks_sig") == _check_sig
+
+    if _deliv_law_idxs:
+        # 実行（ボタンで立てたフラグを、条文キャッシュが揃ったここで処理する）
+        if st.session_state.pop("_run_delivery_check", False):
+            _equip = get_state_value(st.session_state.thread_id, "equipment_info") or {}
+            _equip_summary = _equip_summary_for_check(_equip)
+            _src_by_url = {r.get("url", ""): r for r in _search_results if r.get("url")}
+            _new_checks: dict = {}
+            with get_llm_usage_callback() as _cb, collect_gemini_usage() as _wcb, trace_run(
+                "verify_deliveries", session_id=st.session_state.thread_id,
+            ) as _lf:
+                try:
+                    with st.status("🔍 対応事項をAIでチェック中...", expanded=True) as _stt:
+                        for _i in _deliv_law_idxs:
+                            _law = law_items[_i]
+                            _stt.update(label=f"🔍 チェック中... {_law.get('law_name', '')}")
+                            _lid = _law.get("law_id", "") or _law_id_map.get(_law.get("law_name", ""), "")
+                            _art_texts = st.session_state.get(f"article_text_{_lid}", {}) if _lid else {}
+                            _verdicts = verify_law_deliveries(
+                                _law, _art_texts,
+                                _web_context_for_law(_law, _src_by_url),
+                                _equip_summary, config=_lf,
+                            )
+                            for _d_idx, _vr in _verdicts.items():
+                                _new_checks[f"{_i}:{_d_idx}"] = _vr
+                        _stt.update(label="✅ 対応事項のチェックが完了しました",
+                                    state="complete", expanded=False)
+                finally:
+                    _record_llm_usage(_cb, _wcb)
+            st.session_state.delivery_checks = _new_checks
+            st.session_state.delivery_checks_sig = _check_sig
+            st.session_state.pop("lf_cost_ts", None)  # コスト表示を即更新
+            st.rerun()
+
+        _bc1, _bc2 = st.columns([1.4, 1], vertical_alignment="center")
+        with _bc1:
+            if st.button(
+                "🔍 対応事項をAIで再チェック" if _dchecks_valid else "🔍 対応事項をAIでチェック",
+                use_container_width=True, key="run_delivery_check",
+                help="各届出を条文抜粋・Web出典・設備情報と突き合わせ、"
+                     "根拠あり／要確認／矛盾の疑いを判定します（AIの補助・要確認）",
+            ):
+                st.session_state._run_delivery_check = True
+                st.rerun()
+        with _bc2:
+            if _dchecks_valid:
+                _n_ok = sum(1 for v in _dchecks.values() if v["verdict"] == "ok")
+                _n_ck = sum(1 for v in _dchecks.values() if v["verdict"] == "check")
+                _n_cf = sum(1 for v in _dchecks.values() if v["verdict"] == "conflict")
+                st.caption(f"✅ 根拠あり {_n_ok}／⚠️ 要確認 {_n_ck}／❗ 矛盾疑い {_n_cf}")
+        if _dchecks and not _dchecks_valid:
+            st.caption("※ 調査結果が更新されたため、前回のチェック結果は無効です。再チェックしてください。")
+        elif _dchecks_valid:
+            st.caption("※ AIによる判定です。最終確認は条文原文・所轄窓口でお願いします。")
+        st.markdown("")
+
     for i, law in enumerate(law_items):
         p = law.get("priority", "check")
         icon, label, bg_color, border_color = PRIORITY_STYLE.get(p, PRIORITY_STYLE["check"])
@@ -1692,6 +1925,8 @@ def render_results_detail(idata: dict):
         law_id = law.get("law_id", "") or _law_id_map.get(law_name, "")
 
         relevant_articles = [a for a in law.get("relevant_articles", []) if a and a.strip()]
+        # 条例（e-Gov未収載）向けのAI推定条番号（要原文確認）
+        estimated_articles = [a for a in law.get("estimated_articles", []) if a and a.strip()]
         deliveries = law.get("deliveries", [])
 
         # 届出施設を重複なしで収集
@@ -1755,6 +1990,20 @@ def render_results_detail(idata: dict):
                         '適用要否が未確定の法令で発生します。適用が確定した場合は'
                         '再調査で特定できます。下の e-Gov リンクから直接確認も可能です）'
                         '</span></span>'
+                    )
+                elif is_ordinance and estimated_articles:
+                    # e-Gov で照合できないため、AIが推定した条番号を「要原文確認」明記で表示する
+                    _arts = "　".join(
+                        f'<span style="color:#1565C0;">{html_lib.escape(a)}</span>'
+                        for a in estimated_articles
+                    )
+                    art_str = (
+                        '<span style="color:#C62828;font-weight:700;font-size:12px;">'
+                        'AI推定（要原文確認）</span>'
+                        f'<div style="padding-left:0.2em;margin-top:2px;">{_arts}</div>'
+                        '<div style="font-size:11px;color:#888;margin-top:2px;">'
+                        '※ 条例は e-Gov 未収載のため自動照合できません。AIの推定です。'
+                        '下の例規集リンクで必ず原文をご確認ください</div>'
                     )
                 elif is_ordinance:
                     art_str = (
@@ -1867,7 +2116,7 @@ def render_results_detail(idata: dict):
             # 届出・申請事項
             if deliveries:
                 st.markdown("**📋 届出・申請事項**")
-                for d in deliveries:
+                for d_idx, d in enumerate(deliveries):
                     dp = d.get("priority", "check")
                     d_icon, d_label, d_bg, d_border = PRIORITY_STYLE.get(dp, PRIORITY_STYLE["check"])
                     article_ref = d.get("law_article", "")
@@ -1892,19 +2141,83 @@ def render_results_detail(idata: dict):
                         f'└ 届出先の根拠：{html_lib.escape(basis)}{src_link}</div>'
                         if (basis or src_url) else ""
                     )
+                    # AI再チェックの判定バッジ・理由（実行済みのときのみ）
+                    _vr = _dchecks.get(f"{i}:{d_idx}") if _dchecks_valid else None
+                    verdict_badge = ""
+                    verdict_reason_html = ""
+                    if _vr:
+                        _vi, _vl, _vc, _vbg = _VERDICT_STYLE.get(_vr["verdict"], _VERDICT_STYLE["check"])
+                        verdict_badge = (
+                            f'<span style="background:{_vbg};color:{_vc};font-weight:700;'
+                            f'font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;'
+                            f'white-space:nowrap;">{_vi} {_vl}</span>'
+                        )
+                        if _vr.get("reason"):
+                            verdict_reason_html = (
+                                f'<div style="margin-top:4px;font-size:11.5px;color:{_vc};'
+                                f'line-height:1.6;">🧠 AI判定：{html_lib.escape(_vr["reason"])}</div>'
+                            )
                     st.markdown(
                         f'<div style="background:{d_bg};border-left:4px solid {d_border};'
                         f'padding:9px 13px;border-radius:4px;margin:4px 0;">'
-                        f'<div style="font-weight:600;font-size:14px;">{d_icon} {html_lib.escape(d.get("item", ""))}</div>'
+                        f'<div style="font-weight:600;font-size:14px;">{d_icon} {html_lib.escape(d.get("item", ""))}{verdict_badge}</div>'
                         f'<div style="margin-top:5px;font-size:12px;color:#555;display:flex;flex-wrap:wrap;gap:12px;">'
                         f'{article_html}'
                         f'<span style="color:#1B5E20;font-weight:600;">🏛️ {html_lib.escape(authority_val)}</span>'
                         f'<span>⏰ {html_lib.escape(d.get("deadline", ""))}</span>'
                         f'</div>'
                         f'{basis_html}'
+                        f'{verdict_reason_html}'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
+                    # 根拠展開（条文抜粋・Web出典）と「確認済み」チェック
+                    _ev_c1, _ev_c2 = st.columns([1, 1])
+                    with _ev_c1:
+                        _show_ev = st.checkbox(
+                            "📎 根拠を見る", key=f"deliv_ev_{i}_{d_idx}",
+                            help="この届出の根拠（条文抜粋・Web出典）を表示します",
+                        )
+                    with _ev_c2:
+                        _confirmed = st.checkbox(
+                            "✅ 確認済みにする", key=f"deliv_confirm_{i}_{d_idx}",
+                            help="担当者が原文・窓口で確認済みの印（この画面内の記録用）",
+                        )
+                    if _show_ev:
+                        _ev_parts = []
+                        _la = d.get("law_article", "")
+                        if _la and _la in cached_texts:
+                            _target_arts = [(_la, cached_texts[_la])]
+                        else:
+                            _target_arts = [(a, cached_texts[a]) for a in relevant_articles if a in cached_texts]
+                        if _target_arts:
+                            _ev_parts.append('<div style="font-size:11px;color:#888;margin-bottom:3px;">📜 条文抜粋（e-Gov）</div>')
+                            for _ref, _txt in _target_arts:
+                                _ev_parts.append(
+                                    f'<div style="font-weight:700;font-size:12px;color:#1565C0;">{html_lib.escape(_ref)}</div>'
+                                    f'<div style="font-size:12px;white-space:pre-wrap;color:#333;line-height:1.7;margin-bottom:6px;">{html_lib.escape(_txt)}</div>'
+                                )
+                        elif is_ordinance:
+                            _ev_parts.append(
+                                '<div style="font-size:12px;color:#888;">条例は e-Gov 未収載のため条文抜粋がありません。'
+                                '上の例規集リンクで原文をご確認ください。</div>'
+                            )
+                        else:
+                            _ev_parts.append(
+                                '<div style="font-size:12px;color:#888;">この届出に紐づく条文抜粋は取得できていません。'
+                                '上の e-Gov リンクからご確認ください。</div>'
+                            )
+                        if basis or src_url:
+                            _ev_parts.append(
+                                f'<div style="font-size:11px;color:#888;margin-top:6px;">🌐 届出先の根拠・出典</div>'
+                                f'<div style="font-size:12px;color:#555;line-height:1.6;">{html_lib.escape(basis)}{src_link}</div>'
+                            )
+                        st.markdown(
+                            f'<div style="background:#F8F9FA;border:1px solid #E0E0E0;'
+                            f'border-radius:4px;padding:10px 13px;margin:2px 0 8px;">'
+                            + "".join(_ev_parts) + '</div>',
+                            unsafe_allow_html=True,
+                        )
             else:
                 st.caption(
                     "📋 届出・申請事項：未特定（「届出不要」の意味ではありません。"
@@ -2103,9 +2416,16 @@ def render_sidebar():
         # （アプリ側では概算しない。表示は数秒〜十数秒遅れることがある）
         if langfuse_enabled():
             jpy_rate = float(os.getenv("LLM_COST_JPY_RATE", "150"))
+            # 案件開始前（ui_phase == "start"）でも「💬 AIに質問」でLLMを使えば
+            # コストが発生する。開始前は原則コスト表示を省くが、質問が1件でも
+            # あれば（＝すでに課金が発生していれば）取得・表示する。
+            cost_active = (
+                st.session_state.ui_phase != "start"
+                or bool(st.session_state.get("qa_history"))
+            )
             # Langfuse 側の集計反映は数十秒遅れるため、結果はキャッシュしつつ
             # 自動で再取得する（未反映のうちは15秒間隔・反映後は60秒間隔）。
-            if st.session_state.ui_phase != "start" and not busy:
+            if cost_active and not busy:
                 lf_cost = st.session_state.get("lf_cost")
                 interval = 60 if (lf_cost and lf_cost.get("traces")) else 15
                 if time.time() - st.session_state.get("lf_cost_ts", 0) > interval:
@@ -2119,33 +2439,33 @@ def render_sidebar():
                     f'💰 <b>AI利用コスト ${lf_cost["cost"]:.3f}</b>'
                     f'（約 {lf_cost["cost"] * jpy_rate:,.0f}円）<br>'
                     f'<span style="font-size:11px;color:#777;">'
-                    f'Langfuse 実測値（ヒアリング・調査などの処理 {lf_cost["traces"]}回分の合計。'
+                    f'（ヒアリング・調査などの処理 {lf_cost["traces"]}回分の合計。'
                     f'検索回数とは別の数字です）</span>'
                 )
-            elif st.session_state.ui_phase == "start":
+            elif not cost_active:
                 headline = (
                     f'💰 <b>AI利用コスト</b><br>'
                     f'<span style="font-size:11px;color:#777;">'
-                    f'開始後に Langfuse の実測値を表示します</span>'
+                    f'開始後に表示します</span>'
                 )
             else:
                 headline = (
                     f'💰 <b>AI利用コスト：集計待ち</b><br>'
                     f'<span style="font-size:11px;color:#777;">'
-                    f'Langfuse への反映に数十秒かかることがあります。'
+                    f'反映に数十秒かかることがあります。'
                     f'画面操作時に自動更新されます</span>'
                 )
             st.markdown(
                 f'<div class="sidebar-card">{headline}</div>',
                 unsafe_allow_html=True,
             )
-            if st.session_state.ui_phase != "start":
+            if cost_active:
                 if st.button(
                     "🔄 コスト表示を更新", use_container_width=True, key="lf_cost_refresh",
                     disabled=busy,
                     help="調査などの処理中は、中断を防ぐため更新できません" if busy else None,
                 ):
-                    with st.spinner("Langfuse から取得中..."):
+                    with st.spinner("取得中..."):
                         st.session_state.lf_cost = get_session_cost(st.session_state.thread_id)
                     st.rerun()
             st.divider()

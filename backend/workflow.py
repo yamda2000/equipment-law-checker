@@ -159,6 +159,14 @@ class LawItem(BaseModel):
     applicability: str = Field(description="この設備にこの法令が適用される理由（1〜2行）")
     priority: str = Field(description="required | check | pending")
     relevant_articles: list[str] = Field(default_factory=list, description="関連条文番号リスト（例：['第10条', '第11条第1項']）。特定できるものだけ列挙")
+    estimated_articles: list[str] = Field(
+        default_factory=list,
+        description=(
+            "e-Gov未収載の条例（横浜市・神奈川県条例など）についてのみ、Web検索結果や一般知識から"
+            "推定した該当条番号（例：['第10条（特定施設の届出）']）。原文照合できない推定値のため"
+            "確定条番号(relevant_articles)とは別枠。国法（e-Gov収載）では必ず空にする"
+        ),
+    )
     deliveries: list[DeliveryItem] = Field(default_factory=list, description="届出・申請事項")
     internal_actions: list[InternalActionItem] = Field(default_factory=list, description="社内対応事項")
 
@@ -1140,9 +1148,21 @@ def _ground_relevant_articles(law_items: list) -> None:
         if not article_list:
             # 原文未取得の法令は未検証の条番号を残さない（表示側は「条番号確認中」になる）
             law["relevant_articles"] = []
+            # 横浜市・神奈川県の条例は e-Gov 未収載で照合できないため、LLMが推定した
+            # estimated_articles を「AI推定（要確認）」として残す（最大5件・正規化・重複除去）。
+            # それ以外（国法の名称揺れ等）は未検証の推定を出さない
+            is_ord = any(k in law_name for k in ("条例", "横浜市", "神奈川県"))
+            if is_ord:
+                est = [str(a).strip() for a in law.get("estimated_articles", []) if str(a).strip()]
+                law["estimated_articles"] = list(dict.fromkeys(est))[:5]
+            else:
+                law["estimated_articles"] = []
             for d in law.get("deliveries", []):
                 d["law_article"] = ""
             continue
+
+        # e-Gov 収載法令は relevant_articles で確定するため、推定条番号は使わない
+        law["estimated_articles"] = []
 
         emit(f"📖 「{law_name}」の条番号を e-Gov 原文と照合中...")
         valid_refs = {a["ref"] for a in article_list}
@@ -1660,13 +1680,16 @@ def _refine_law_items(law_items: list, equipment_info: dict, instruction: str) -
     except Exception:
         return law_items
 
-    # LawItem スキーマに無い law_id / law_revision_id を法令名で再付与（条文リンク維持）
+    # LawItem スキーマに無い law_id / law_revision_id を法令名で再付与（条文リンク維持）。
+    # estimated_articles は system側でグラウンディング済み（条例のみ・要確認）なので、
+    # 文面修正LLMの出力ではなく元の値を復元して保持する
     orig_by_name = {l.get("law_name", ""): l for l in law_items}
     for it in refined:
         o = orig_by_name.get(it.get("law_name", ""))
         if o:
-            it["law_id"]          = o.get("law_id", "")
-            it["law_revision_id"] = o.get("law_revision_id", "")
+            it["law_id"]              = o.get("law_id", "")
+            it["law_revision_id"]     = o.get("law_revision_id", "")
+            it["estimated_articles"]  = o.get("estimated_articles", [])
     return refined or law_items
 
 

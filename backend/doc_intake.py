@@ -17,10 +17,16 @@ from backend.prompts import DOC_EXTRACTION_SYSTEM
 
 logger = logging.getLogger(__name__)
 
-# 抽出テキストの上限文字数（トークン膨張防止。超過分は切り捨て）
-# 80ページ級のカタログPDF（15万字程度）も切り捨てずに読めるよう既定160,000字。
-# 入力単価が高いモデルを使う場合は DOC_MAX_TEXT_CHARS で下げられる
-MAX_TEXT_CHARS = int(os.getenv("DOC_MAX_TEXT_CHARS", "160000"))
+# 1回のLLM抽出に渡すチャンクの文字数。長い資料はこのサイズで分割し、
+# パートごとに抽出してから項目を統合する（末尾切り捨てによる後半の取りこぼしを防ぐ）。
+# モデルのコンテキスト窓に安全に収まる範囲にする（gpt-4o 等で 45,000 字が目安）。
+CHUNK_CHARS = int(os.getenv("DOC_CHUNK_CHARS", "45000"))
+
+# 全資料を通しての絶対上限（暴走的なコスト・処理時間を防ぐ安全弁）。
+# 通常はチャンク分割で全文を読むため切り捨ては起きない。これを超える巨大な
+# アップロードのみ、超過分を末尾から切り捨てて警告する。
+# 分割抽出のLLM呼び出し回数の上限はおおよそ MAX_TEXT_CHARS / CHUNK_CHARS。
+MAX_TEXT_CHARS = int(os.getenv("DOC_MAX_TEXT_CHARS", "480000"))
 
 
 # ─── ファイル種別ごとのテキスト抽出 ──────────────────────────────
@@ -189,10 +195,99 @@ def _fit_doc_texts(doc_texts: list, cap: int) -> tuple[list, list]:
     return fitted, truncated
 
 
+def _split_text(text: str, size: int) -> list[str]:
+    """text を size 文字以下の断片に分割する。できるだけ改行位置で区切り、
+    1行が size を超える場合のみ途中で強制的に切る（ページ・行の途中割れを最小化）。"""
+    if size <= 0 or len(text) <= size:
+        return [text] if text else []
+    pieces: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if n - i <= size:
+            pieces.append(text[i:])
+            break
+        cut = text.rfind("\n", i, i + size)
+        if cut <= i:
+            cut = i + size  # 改行が無ければ強制カット
+        pieces.append(text[i:cut])
+        i = cut
+        while i < n and text[i] == "\n":  # 断片先頭の改行を食う
+            i += 1
+    return pieces
+
+
+def _build_chunks(fitted: list, chunk_chars: int) -> list[str]:
+    """採用テキストを、資料名ラベル付きで chunk_chars 以下のチャンクにまとめる。
+    小さい資料は詰め合わせ、大きい資料は改行境界で分割して複数チャンクに渡す。"""
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for name, text in fitted:
+        if not text.strip():
+            continue
+        header = f"===== 資料: {name} =====\n"
+        budget = max(1000, chunk_chars - len(header))
+        for piece in _split_text(text, budget):
+            block = header + piece
+            if cur and cur_len + len(block) > chunk_chars:
+                chunks.append("\n\n".join(cur))
+                cur, cur_len = [], 0
+            cur.append(block)
+            cur_len += len(block) + 2
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+def _norm(s: str) -> str:
+    """統合時の重複判定用の正規化（空白除去・小文字化）。"""
+    return re.sub(r"\s+", "", s or "").lower()
+
+
+def _merge_extractions(partials: list[dict]) -> dict:
+    """複数パートの抽出結果を項目ごとに統合する。
+    同一・内包関係の値は重複としてまとめ、異なる値は「／」で併記する
+    （後半パートの情報を落とさないことを優先し、確認画面で担当者が整理する想定）。"""
+    merged: dict = {}
+    for field in DocExtraction.model_fields:
+        values: list[str] = []
+        evidences: list[str] = []
+        for p in partials:
+            f = p.get(field) or {}
+            v = (f.get("value") or "").strip()
+            if not v:
+                continue
+            nv = _norm(v)
+            dup = False
+            for idx, existing in enumerate(values):
+                ne = _norm(existing)
+                if nv == ne or nv in ne:
+                    dup = True            # 既出と同一・既出に内包される
+                    break
+                if ne in nv:              # 新しい値が既出を内包 → 置き換える
+                    values[idx] = v
+                    dup = True
+                    break
+            if not dup:
+                values.append(v)
+            e = (f.get("evidence") or "").strip()
+            if e and e not in evidences:
+                evidences.append(e)
+        merged[field] = {
+            "value": "／".join(values)[:1000],
+            "evidence": "；".join(evidences)[:500],
+        }
+    return merged
+
+
 def extract_equipment_info(
     doc_texts: list, config: dict | None = None
 ) -> tuple[dict, list]:
     """[(ファイル名, 抽出テキスト), ...] からヒアリング11項目を構造化抽出する。
+
+    長い資料は CHUNK_CHARS 単位に分割して各パートから抽出し、項目ごとに統合する
+    （従来の末尾切り捨てによる後半情報の取りこぼしを防ぐ）。全資料の合計が
+    MAX_TEXT_CHARS を超える場合のみ、安全弁として超過分を切り捨てて報告する。
 
     config: LLM 呼び出しに渡す RunnableConfig（Langfuse の callbacks 等）。
     返り値: ({フィールド名: {"value": str, "evidence": str}},
@@ -204,19 +299,30 @@ def extract_equipment_info(
     fitted, truncated = _fit_doc_texts(doc_texts, MAX_TEXT_CHARS)
     if truncated:
         logger.warning(
-            "資料テキストが上限 %d 字を超過。切り捨て: %s",
+            "資料テキストが絶対上限 %d 字を超過。切り捨て: %s",
             MAX_TEXT_CHARS,
             [(t["name"], f'{t["used"]}/{t["total"]}字') for t in truncated],
         )
-    combined = "\n\n".join(
-        f"===== 資料: {name} =====\n{text}" for name, text in fitted
-    )
 
     llm = _llm().with_structured_output(DocExtraction)
-    result: DocExtraction = llm.invoke([
-        SystemMessage(DOC_EXTRACTION_SYSTEM),
-        HumanMessage(f"以下の資料から設備情報を抽出してください。\n\n{combined}"),
-    ], config=config or {})
-    return _relocate_refrigerant(
-        {name: field.model_dump() for name, field in result}
-    ), truncated
+
+    def _extract(chunk_text: str) -> dict:
+        result: DocExtraction = llm.invoke([
+            SystemMessage(DOC_EXTRACTION_SYSTEM),
+            HumanMessage(f"以下の資料から設備情報を抽出してください。\n\n{chunk_text}"),
+        ], config=config or {})
+        return {name: field.model_dump() for name, field in result}
+
+    chunks = _build_chunks(fitted, CHUNK_CHARS)
+    if not chunks:
+        # 全資料が空（抽出テキストなし）：空の結果を返す
+        merged = {name: field.model_dump() for name, field in DocExtraction()}
+    elif len(chunks) == 1:
+        merged = _extract(chunks[0])
+    else:
+        # 資料が長い：分割抽出 → 項目統合（後半の取りこぼしを防ぐ）
+        logger.info("資料を %d チャンクに分割して抽出します（合計約%d字）",
+                    len(chunks), sum(len(t) for _n, t in fitted))
+        merged = _merge_extractions([_extract(c) for c in chunks])
+
+    return _relocate_refrigerant(merged), truncated

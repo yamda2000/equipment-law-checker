@@ -504,6 +504,8 @@ def _build_article_block(law: dict) -> str:
     law_id = law.get("law_id", "")
     law_revision_id = law.get("law_revision_id", "")
     relevant_articles = [a for a in law.get("relevant_articles", []) if a and a.strip()]
+    # 条例（e-Gov未収載）向けのAI推定条番号（要原文確認）
+    estimated_articles = [a for a in law.get("estimated_articles", []) if a and a.strip()]
 
     # 届出施設を重複なしで収集
     authorities = list(dict.fromkeys(
@@ -567,6 +569,19 @@ def _build_article_block(law: dict) -> str:
                 '適用要否が未確定の法令で発生します。適用が確定した場合は'
                 '再調査で特定できます。e-Gov で直接確認も可能です）'
                 '</span></span>'
+            )
+        elif is_ordinance and estimated_articles:
+            # e-Gov で照合できないため、AIが推定した条番号を「要原文確認」明記で表示する
+            arts = "　".join(
+                f'<span style="color:#1565C0;">{_esc(a)}</span>' for a in estimated_articles
+            )
+            art_str = (
+                '<span style="color:#C62828;font-weight:700;font-size:12px;">'
+                'AI推定（要原文確認）</span>'
+                f'<div style="padding-left:0.2em;margin-top:2px;">{arts}</div>'
+                '<div style="font-size:11px;color:#888;margin-top:2px;">'
+                '※ 条例は e-Gov 未収載のため自動照合できません。AIの推定です。'
+                '下の例規集リンクで必ず原文をご確認ください</div>'
             )
         elif is_ordinance:
             art_str = (
