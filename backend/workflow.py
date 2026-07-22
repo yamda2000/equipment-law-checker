@@ -152,6 +152,21 @@ class InternalActionItem(BaseModel):
     item: str = Field(description="社内対応事項の内容")
     responsible: str = Field(description="担当部署・担当者（例：安全環境部、設備担当者）")
     deadline: str = Field(description="対応期限の目安（例：稼働3ヶ月前）")
+    basis: str = Field(
+        default="",
+        description=(
+            "この社内対応がなぜ必要かの根拠。根拠となる条文・社内規程・調査結果を"
+            "具体的に書く（例：労働安全衛生法第14条により作業主任者の選任が義務付け"
+            "られているため／社内規程『設備安全審査要領』に基づく）。空にしない"
+        ),
+    )
+    basis_source_id: str = Field(
+        default="",
+        description=(
+            "根拠に使った調査結果のID（調査結果一覧の [R◯] の◯部分。例：\"R7\"）。"
+            "社内文書やWebページを根拠にした場合のみ記入し、条文のみが根拠の場合は空文字"
+        ),
+    )
 
 
 class LawItem(BaseModel):
@@ -456,7 +471,7 @@ def policy_review_node(state: AppState) -> dict:
                 break
 
     return {
-        "messages":    [AIMessage("調査方針が承認されました。e-Gov API で法令を調査します。")],
+        "messages":    [AIMessage("調査方針が承認されました。e-Gov法令API・Web検索・社内文書（登録時）を用いて法令を調査します。")],
         "policy_note": policy_note,
         "phase":       "searching",
     }
@@ -1289,26 +1304,33 @@ def _prefetch_article_excerpts(
 
 # ─── 届出先出典の解決 ─────────────────────────────────────────────
 def _attach_delivery_sources(law_items: list, search_results: list) -> None:
-    """deliveries.authority_source_id（[R◯]）を検索結果のURL・タイトルに解決して付与する（in-place）。
+    """deliveries.authority_source_id / internal_actions.basis_source_id（[R◯]）を
+    検索結果のURL・タイトルに解決して付与する（in-place）。
     LLMにURLを直接書かせるとハルシネーションするため、IDで参照させて
     実在する検索結果から決定的に解決する。実在しないIDはリンクなしになるだけ。"""
     by_id = {
         f"R{i}": r for i, r in enumerate(search_results[:MAX_SEARCH_RESULTS], 1)
     }
+
+    def _resolve(item: dict, id_key: str, prefix: str) -> None:
+        sid = str(item.get(id_key, "") or "").strip().strip("[]")
+        r = by_id.get(sid)
+        if r and r.get("url"):
+            item[f"{prefix}_url"]   = r["url"]
+            item[f"{prefix}_title"] = r.get("title", "")
+            # レポート生成時に Grounding 由来リンクを除外するための種別
+            # （Gemini API 追加利用規約: Grounding 結果のリンクは保存不可）
+            item[f"{prefix}_kind"]  = r.get("source", "")
+        else:
+            item[f"{prefix}_url"]   = ""
+            item[f"{prefix}_title"] = ""
+            item[f"{prefix}_kind"]  = ""
+
     for law in law_items:
         for d in law.get("deliveries", []):
-            sid = str(d.get("authority_source_id", "") or "").strip().strip("[]")
-            r = by_id.get(sid)
-            if r and r.get("url"):
-                d["authority_source_url"]   = r["url"]
-                d["authority_source_title"] = r.get("title", "")
-                # レポート生成時に Grounding 由来リンクを除外するための種別
-                # （Gemini API 追加利用規約: Grounding 結果のリンクは保存不可）
-                d["authority_source_kind"]  = r.get("source", "")
-            else:
-                d["authority_source_url"]   = ""
-                d["authority_source_title"] = ""
-                d["authority_source_kind"]  = ""
+            _resolve(d, "authority_source_id", "authority_source")
+        for a in law.get("internal_actions", []):
+            _resolve(a, "basis_source_id", "basis_source")
 
 
 # ─── 法令名マッチング ─────────────────────────────────────────────
@@ -1525,6 +1547,7 @@ def synthesis_node(state: AppState) -> dict:
                         "item":        "本法令の適用要否の確認（仕様・数量等の確定後に判定）",
                         "responsible": "設備導入担当者",
                         "deadline":    "稼働前",
+                        "basis":       f"確認漏れ防止チェックにより自動追加（{c['origin']}）。適用要否が未確定のため確認が必要",
                     }],
                     "law_id":            c.get("law_id", ""),
                     "law_revision_id":   c.get("law_revision_id", ""),

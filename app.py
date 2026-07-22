@@ -310,6 +310,31 @@ div[data-stale="true"] button { visibility: hidden !important; }
 
 /* 入力欄の英語ヒント（Press Enter to submit form 等）を非表示 */
 div[data-testid="InputInstructions"] { display: none; }
+
+/* メイン画面（フォーム）のテキスト入力欄が薄い背景(#f5f7fa)に埋もれて
+   「どこが入力欄か」分かりにくい問題への対処。白背景＋はっきりした枠線で
+   入力欄の範囲を明確にする。ダークテーマのQAパネル(stPopoverBody)は
+   body 直下に描画され .block-container の外なので影響を受けない */
+.block-container div[data-baseweb="input"],
+.block-container div[data-baseweb="base-input"],
+.block-container div[data-baseweb="textarea"] {
+    background: #ffffff !important;
+    border: 1px solid #90A4AE !important;
+    border-radius: 8px !important;
+}
+.block-container div[data-baseweb="input"] input,
+.block-container div[data-baseweb="base-input"] input,
+.block-container div[data-baseweb="textarea"] textarea {
+    background: #ffffff !important;
+    color: #1a1a1a !important;
+}
+/* フォーカス時は青枠＋淡いリングで入力位置を強調 */
+.block-container div[data-baseweb="input"]:focus-within,
+.block-container div[data-baseweb="base-input"]:focus-within,
+.block-container div[data-baseweb="textarea"]:focus-within {
+    border-color: #1565C0 !important;
+    box-shadow: 0 0 0 2px rgba(21,101,192,.18) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -492,33 +517,6 @@ def get_llm_usage_callback():
         _llm_usage_cb_var.reset(token)
 
 
-def format_live_usage(cb) -> str:
-    """調査など重い処理の実行中に、これまでのAI利用状況をライブ表示する文字列。
-    サイドバーのコスト（Langfuse実測値・反映が遅れる）とは別に、処理中も進捗が
-    見えるよう、コールバックが積算した呼び出し回数・トークンをその場で表示する。
-    単価（LLM_COST_*_PER_1M）が設定されていれば概算額も添える。"""
-    calls      = cb.successful_requests
-    prompt     = cb.prompt_tokens
-    completion = cb.completion_tokens
-    in_rate  = os.getenv("LLM_COST_INPUT_PER_1M")
-    out_rate = os.getenv("LLM_COST_OUTPUT_PER_1M")
-    if in_rate and out_rate:
-        try:
-            jpy_rate = float(os.getenv("LLM_COST_JPY_RATE", "150"))
-            cost = prompt / 1e6 * float(in_rate) + completion / 1e6 * float(out_rate)
-            return (
-                f"💰 AI利用（実行中の概算）：生成AI {calls}回 / "
-                f"${cost:.3f}（約 {cost * jpy_rate:,.0f}円）"
-            )
-        except ValueError:
-            pass
-    return (
-        f"💰 AI利用（実行中）：生成AI {calls}回・"
-        f"入力 {prompt:,} / 出力 {completion:,} トークン"
-        f"（確定額は完了後にサイドバーへ反映）"
-    )
-
-
 def _record_llm_usage(cb, web_cb=None) -> None:
     """get_llm_usage_callback の計測結果を案件単位で積算する。
 
@@ -532,6 +530,9 @@ def _record_llm_usage(cb, web_cb=None) -> None:
     LLM_COST_OUTPUT_PER_1M（USD/100万トークン）が明示設定されている場合だけ
     計上する。無い呼び出しは unpriced（単価不明）として件数のみ数え、金額には
     含めない（誤った単価で「それらしい金額」を表示しない）。"""
+    # どの経路の課金でもサイドバーのコスト表示が追従するよう、計上のたびに
+    # 更新フラグを立てる（Langfuse 反映待ちの自動ポーリングもここから始まる）
+    _flag_cost_refresh()
     if langfuse_enabled():
         return
     _record_web_search_usage(web_cb)
@@ -609,6 +610,27 @@ def _record_web_search_usage(web_cb) -> None:
             )
         else:
             web["unpriced"] = True
+
+
+# Langfuse 反映待ちの自動ポーリング上限（秒）。反映は数十秒遅れるため、
+# これを超えたら諦めて自動更新を止める（無限にポーリングしない）。
+_LF_COST_AWAIT_SECONDS = 150
+
+
+def _flag_cost_refresh() -> None:
+    """重い処理・課金の直後に呼ぶ。サイドバーの「AI利用コスト」表示を
+    次の描画で即再取得させ（15/60秒の間引きを解除）、さらに Langfuse の
+    集計反映が遅れる分を追いかけて一定時間 自動ポーリングし、額が更新され
+    続けるようにする（Langfuse 未使用時は概算を同期計上済みなので不要）。"""
+    st.session_state.pop("lf_cost_ts", None)
+    if langfuse_enabled():
+        prev = st.session_state.get("lf_cost")
+        st.session_state.lf_await_cost = True
+        st.session_state.lf_await_deadline = time.time() + _LF_COST_AWAIT_SECONDS
+        st.session_state.lf_await_last = None
+        # 処理前の額をベースラインに保持。ポーリングで額がこれを上回り（＝今回分が
+        # 反映され）、さらに変化が止まったら反映完了とみなして自動更新を止める。
+        st.session_state.lf_await_base_cost = prev.get("cost") if prev else None
 
 
 # ─────────────────────────────────────────
@@ -1206,9 +1228,6 @@ def resume_graph(decision):
     if will_search:
         # 調査フェーズは各ステップの進捗をライブ表示（stream_mode="custom"）
         status = st.status("🔎 AI調査を開始しています...", expanded=True)
-        # 生成AIを何度も呼ぶ調査中も利用状況が見えるよう、進捗ごとに更新する
-        # ライブ表示（サイドバーのLangfuse実測値は完了後に反映される）
-        cost_ph = st.empty()
         try:
             with get_llm_usage_callback() as cb, collect_gemini_usage() as web_cb, trace_run(
                 f"search:{current_phase or 'resume'}",
@@ -1224,12 +1243,9 @@ def resume_graph(decision):
                         if entry:
                             status.update(label=f"AI調査中... {entry}")
                             status.write(entry)
-                            # 進捗ステップごとに、これまでのAI利用状況を更新表示
-                            cost_ph.markdown(format_live_usage(cb))
                 finally:
                     # エラー時も、そこまでに消費したトークンを計上する
                     _record_llm_usage(cb, web_cb)
-                    cost_ph.markdown(format_live_usage(cb))
         except Exception:
             logger.error("調査フェーズ (workflow.stream) でエラー:\n%s", traceback.format_exc())
             status.update(label="⚠️ 調査中にエラーが発生しました", state="error", expanded=True)
@@ -1257,9 +1273,8 @@ def resume_graph(decision):
             return
 
     _process_new_msgs(old_count, skip_human=False)
-    # 重い処理の直後は、サイドバーが最新のLangfuse実測コストを取り直すよう促す
-    # （通常の15/60秒間隔を待たず、次の描画で即取得させる）
-    st.session_state.pop("lf_cost_ts", None)
+    # コスト表示の更新フラグは _record_llm_usage() 内で立つ（この直前の finally で計上済み）。
+    # 反映遅延の間はサイドバーが自動ポーリングして額を更新し続ける。
 
     idata = get_interrupt_data(st.session_state.thread_id)
     if idata:
@@ -1893,7 +1908,7 @@ def render_results_detail(idata: dict):
                     _record_llm_usage(_cb, _wcb)
             st.session_state.delivery_checks = _new_checks
             st.session_state.delivery_checks_sig = _check_sig
-            st.session_state.pop("lf_cost_ts", None)  # コスト表示を即更新
+            # コスト表示の更新フラグは直前の _record_llm_usage() 内で立っている
             st.rerun()
 
         _bc1, _bc2 = st.columns([1.4, 1], vertical_alignment="center")
@@ -2231,11 +2246,31 @@ def render_results_detail(idata: dict):
             if internal:
                 st.markdown("**🏢 社内対応事項**")
                 for act in internal:
+                    _resp = act.get("responsible", "")
+                    _resp_html = (
+                        f'　<span style="color:#4527A0;">👤 {html_lib.escape(_resp)}</span>'
+                        if _resp else ""
+                    )
+                    # 根拠（届出・申請事項と同様に、なぜ必要かの根拠と出典を示す）
+                    _ibasis = act.get("basis", "")
+                    _isrc_url = act.get("basis_source_url", "")
+                    _isrc_link = (
+                        f'　<a href="{html_lib.escape(_isrc_url)}" target="_blank" '
+                        f'style="color:#1565C0;">🔗 '
+                        f'{html_lib.escape((act.get("basis_source_title") or "出典ページ")[:40])}</a>'
+                        if _isrc_url else ""
+                    )
+                    _ibasis_html = (
+                        f'<div style="margin-top:4px;font-size:11.5px;color:#607D8B;line-height:1.6;">'
+                        f'└ 根拠：{html_lib.escape(_ibasis)}{_isrc_link}</div>'
+                        if (_ibasis or _isrc_url) else ""
+                    )
                     st.markdown(
                         f'<div style="background:#F3F4F6;border-left:4px solid #6B7280;'
                         f'padding:8px 12px;border-radius:4px;margin:4px 0;">'
                         f'● <strong>{html_lib.escape(act.get("item", ""))}</strong><br>'
-                        f'<span style="font-size:12px;color:#555;">⏰ 期限：{html_lib.escape(act.get("deadline", ""))}</span>'
+                        f'<span style="font-size:12px;color:#555;">⏰ 期限：{html_lib.escape(act.get("deadline", ""))}{_resp_html}</span>'
+                        f'{_ibasis_html}'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
@@ -2423,52 +2458,87 @@ def render_sidebar():
                 st.session_state.ui_phase != "start"
                 or bool(st.session_state.get("qa_history"))
             )
-            # Langfuse 側の集計反映は数十秒遅れるため、結果はキャッシュしつつ
-            # 自動で再取得する（未反映のうちは15秒間隔・反映後は60秒間隔）。
-            if cost_active and not busy:
+
+            def _render_lf_cost_card(auto: bool = False):
+                """AI利用コスト表示。auto=True は run_every による自動ポーリング中で、
+                Langfuse の集計反映（数十秒遅れ）を追いかけて額を更新する。"""
+                # 取得タイミング：通常描画は 15/60秒間引き、自動ポーリング中は毎回取得
+                if cost_active and not busy:
+                    if auto:
+                        do_fetch = True
+                    else:
+                        lc = st.session_state.get("lf_cost")
+                        interval = 60 if (lc and lc.get("traces")) else 15
+                        do_fetch = time.time() - st.session_state.get("lf_cost_ts", 0) > interval
+                    if do_fetch:
+                        fetched = get_session_cost(st.session_state.thread_id)
+                        if fetched is not None:
+                            st.session_state.lf_cost = fetched
+                        st.session_state.lf_cost_ts = time.time()
+
+                # 自動ポーリングの停止判定：額が処理前のベースラインを上回り（今回分が
+                # 反映され）、かつ次の取得でも変化しなくなったら反映完了とみなす。
+                # 期限超過でも止める（Langfuseが増えないケースの保険）。
+                if auto:
+                    cur = st.session_state.get("lf_cost")
+                    cur_cost = cur.get("cost") if cur else None
+                    base = st.session_state.get("lf_await_base_cost")
+                    increased = cur_cost is not None and (base is None or cur_cost > base + 1e-9)
+                    last = st.session_state.get("lf_await_last")
+                    settled = increased and last is not None and abs(cur_cost - last) < 1e-9
+                    st.session_state.lf_await_last = cur_cost
+                    if settled or time.time() > st.session_state.get("lf_await_deadline", 0):
+                        st.session_state.lf_await_cost = False
+                        st.rerun()  # run_every を外した静的描画に戻す
+
                 lf_cost = st.session_state.get("lf_cost")
-                interval = 60 if (lf_cost and lf_cost.get("traces")) else 15
-                if time.time() - st.session_state.get("lf_cost_ts", 0) > interval:
-                    fetched = get_session_cost(st.session_state.thread_id)
-                    if fetched is not None:
-                        st.session_state.lf_cost = fetched
-                    st.session_state.lf_cost_ts = time.time()
-            lf_cost = st.session_state.get("lf_cost")
-            if lf_cost and lf_cost.get("traces"):
-                headline = (
-                    f'💰 <b>AI利用コスト ${lf_cost["cost"]:.3f}</b>'
-                    f'（約 {lf_cost["cost"] * jpy_rate:,.0f}円）<br>'
-                    f'<span style="font-size:11px;color:#777;">'
-                    f'（ヒアリング・調査などの処理 {lf_cost["traces"]}回分の合計。'
-                    f'検索回数とは別の数字です）</span>'
+                if lf_cost and lf_cost.get("traces"):
+                    headline = (
+                        f'💰 <b>AI利用コスト ${lf_cost["cost"]:.3f}</b>'
+                        f'（約 {lf_cost["cost"] * jpy_rate:,.0f}円）<br>'
+                        f'<span style="font-size:11px;color:#777;">'
+                        f'（ヒアリング・調査などの処理 {lf_cost["traces"]}回分の合計。'
+                        f'検索回数とは別の数字です）</span>'
+                    )
+                elif not cost_active:
+                    headline = (
+                        f'💰 <b>AI利用コスト</b><br>'
+                        f'<span style="font-size:11px;color:#777;">'
+                        f'開始後に表示します</span>'
+                    )
+                else:
+                    # 集計待ち。auto 中は自動で追従するのでその旨を示す
+                    sub = (
+                        '反映に数十秒かかります。自動で更新中…' if auto
+                        else '反映に数十秒かかることがあります。画面操作時に自動更新されます'
+                    )
+                    headline = (
+                        f'💰 <b>AI利用コスト：集計待ち</b><br>'
+                        f'<span style="font-size:11px;color:#777;">{sub}</span>'
+                    )
+                st.markdown(
+                    f'<div class="sidebar-card">{headline}</div>',
+                    unsafe_allow_html=True,
                 )
-            elif not cost_active:
-                headline = (
-                    f'💰 <b>AI利用コスト</b><br>'
-                    f'<span style="font-size:11px;color:#777;">'
-                    f'開始後に表示します</span>'
-                )
+                if cost_active:
+                    if st.button(
+                        "🔄 コスト表示を更新", use_container_width=True, key="lf_cost_refresh",
+                        disabled=busy,
+                        help="調査などの処理中は、中断を防ぐため更新できません" if busy else None,
+                    ):
+                        with st.spinner("取得中..."):
+                            st.session_state.lf_cost = get_session_cost(st.session_state.thread_id)
+                        st.rerun()
+                st.divider()
+
+            # 重い処理の直後は Langfuse 反映が遅れるため、待ち状態の間だけ
+            # このカードだけを run_every で定期再描画し、額を自動で更新する
+            # （メインの処理は巻き込まない）。反映後・処理中は静的描画に戻す。
+            awaiting = bool(st.session_state.get("lf_await_cost")) and cost_active and not busy
+            if awaiting:
+                st.fragment(_render_lf_cost_card, run_every="10s")(auto=True)
             else:
-                headline = (
-                    f'💰 <b>AI利用コスト：集計待ち</b><br>'
-                    f'<span style="font-size:11px;color:#777;">'
-                    f'反映に数十秒かかることがあります。'
-                    f'画面操作時に自動更新されます</span>'
-                )
-            st.markdown(
-                f'<div class="sidebar-card">{headline}</div>',
-                unsafe_allow_html=True,
-            )
-            if cost_active:
-                if st.button(
-                    "🔄 コスト表示を更新", use_container_width=True, key="lf_cost_refresh",
-                    disabled=busy,
-                    help="調査などの処理中は、中断を防ぐため更新できません" if busy else None,
-                ):
-                    with st.spinner("取得中..."):
-                        st.session_state.lf_cost = get_session_cost(st.session_state.thread_id)
-                    st.rerun()
-            st.divider()
+                _render_lf_cost_card(auto=False)
 
         usage = st.session_state.get("llm_usage")
         if usage and usage.get("calls"):

@@ -743,10 +743,30 @@ def _build_law_items(law_items: list) -> str:
 
         internal_html = ""
         for act in law.get("internal_actions", []):
+            _resp = act.get("responsible", "")
+            _resp_meta = f'　👤 担当：{_esc(_resp)}' if _resp else ""
+            _ibasis = act.get("basis", "")
+            _isrc_url = act.get("basis_source_url", "")
+            _isrc_title = act.get("basis_source_title") or "出典ページ"
+            # 届出側と同様、Grounding 由来リンクは恒久保存レポートに掲載しない
+            if act.get("basis_source_kind", "") == "Gemini Grounding":
+                _isrc_url = ""
+                _isrc_title = ""
+            _isrc_link = (
+                f'　<a href="{_esc(_isrc_url)}" target="_blank" style="color:#1565C0;">🔗 '
+                f'{_esc(_isrc_title[:40])}</a>'
+                if _isrc_url else ""
+            )
+            _ibasis_html = (
+                f'<div style="font-size:11px;color:#607D8B;margin-top:2px;line-height:1.6;">'
+                f'└ 根拠：{_esc(_ibasis)}{_isrc_link}</div>'
+                if (_ibasis or _isrc_url) else ""
+            )
             internal_html += (
                 f'<div class="internal-row">'
                 f'● {_esc(act.get("item", ""))}'
-                f'<div class="internal-meta">⏰ 期限：{_esc(act.get("deadline", ""))}</div>'
+                f'<div class="internal-meta">⏰ 期限：{_esc(act.get("deadline", ""))}{_resp_meta}</div>'
+                f'{_ibasis_html}'
                 f'</div>'
             )
 
